@@ -116,14 +116,14 @@ def list_files(
     }
 
 @mcp.tool()
-def read_file_metadata(file_id: str) -> dict:
+def read_file_metadata(fileId: str) -> dict:
     """Get metadata for a specific file."""
     service = get_drive_service()
-    file = service.files().get(file_id=file_id, fields="*").execute()
+    file = service.files().get(fileId=fileId, fields="*").execute()
     return file
 
 @mcp.tool()
-def download_file(file_id: str) -> str:
+def download_file(fileId: str) -> str:
     """
     Download/Export a file's content. 
     Note: Only works for binary files or Docs that can be exported to plain text.
@@ -132,23 +132,23 @@ def download_file(file_id: str) -> str:
     service = get_drive_service()
     
     # First check mimeType to see if it's a Google Doc
-    file_meta = service.files().get(file_id=file_id).execute()
+    file_meta = service.files().get(fileId=fileId).execute()
     mime_type = file_meta.get('mimeType')
     
     if mime_type == 'application/vnd.google-apps.document':
         # Export Google Docs to plain text
-        request = service.files().export_media(fileId=file_id, mimeType='text/plain')
+        request = service.files().export_media(fileId=fileId, mimeType='text/plain')
     elif mime_type == 'application/vnd.google-apps.spreadsheet':
         # Export Sheets to CSV
-        request = service.files().export_media(fileId=file_id, mimeType='text/csv')
+        request = service.files().export_media(fileId=fileId, mimeType='text/csv')
     elif mime_type == 'application/vnd.google-apps.script':
         # JSON export for scripts
-        request = service.files().export_media(fileId=file_id, mimeType='application/vnd.google-apps.script+json')
+        request = service.files().export_media(fileId=fileId, mimeType='application/vnd.google-apps.script+json')
     elif mime_type.startswith('application/vnd.google-apps.'):
         return f"File type {mime_type} export not yet supported in this scaffold."
     else:
         # Binary file
-        request = service.files().get_media(fileId=file_id)
+        request = service.files().get_media(fileId=fileId)
         
     fh = io.BytesIO()
     downloader = MediaIoBaseDownload(fh, request)
@@ -165,25 +165,25 @@ def download_file(file_id: str) -> str:
 # -- Apps Script Tools ---------------------------------------------------------
 
 @mcp.tool()
-def script_get_content(script_id: str) -> dict:
+def script_get_content(scriptId: str) -> dict:
     """
     Get the content (code files) of a Google Apps Script project.
     Returns a list of files with their source code.
     """
     service = get_script_service()
     try:
-        content = service.projects().getContent(scriptId=script_id).execute()
+        content = service.projects().getContent(scriptId=scriptId).execute()
         return content
     except HttpError as e:
         return {"error": str(e)}
 
 @mcp.tool()
-def script_update_content(script_id: str, files: List[Dict[str, Any]], merge: bool = True) -> dict:
+def script_update_content(scriptId: str, files: List[Dict[str, Any]], merge: bool = True) -> dict:
     """
     Update the content (code files) of a Google Apps Script project.
     
     Args:
-        script_id: The ID of the script project.
+        scriptId: The ID of the script project.
         files: A list of file objects. Each object must have 'name', 'type', and 'source'.
                Type can be 'SERVER_JS', 'HTML', 'JSON'.
         merge: If True (default), merges with existing files (updating matches, adding new).
@@ -202,7 +202,7 @@ def script_update_content(script_id: str, files: List[Dict[str, Any]], merge: bo
         
         if merge:
             # Get existing content to merge
-            current_content = service.projects().getContent(scriptId=script_id).execute()
+            current_content = service.projects().getContent(scriptId=scriptId).execute()
             current_files_map = {f['name']: f for f in current_content.get('files', [])}
             
             # Update with new files
@@ -214,13 +214,13 @@ def script_update_content(script_id: str, files: List[Dict[str, Any]], merge: bo
             final_files = files
 
         request = {"files": final_files}
-        result = service.projects().updateContent(scriptId=script_id, body=request).execute()
+        result = service.projects().updateContent(scriptId=scriptId, body=request).execute()
         return result
     except HttpError as e:
         return {"error": str(e)}
 
 @mcp.tool()
-def script_run_function(script_id: str, function_name: str, parameters: List[Any] = [], dev_mode: bool = False) -> dict:
+def script_run_function(scriptId: str, function_name: str, parameters: List[Any] = [], dev_mode: bool = False) -> dict:
     """
     Execute a function in a Google Apps Script project.
     
@@ -229,7 +229,7 @@ def script_run_function(script_id: str, function_name: str, parameters: List[Any
     2. The Service Account must have access to the script.
     
     Args:
-        script_id: The script ID.
+        scriptId: The script ID.
         function_name: The name of the function to run.
         parameters: List of parameters to pass to the function.
         dev_mode: If true, runs the HEAD version (requires editor access). If false, runs the deployed version.
@@ -243,18 +243,18 @@ def script_run_function(script_id: str, function_name: str, parameters: List[Any
     }
     
     try:
-        response = service.scripts().run(scriptId=script_id, body=request).execute()
+        response = service.scripts().run(scriptId=scriptId, body=request).execute()
         return response
     except HttpError as e:
         return {"error": str(e)}
 
 @mcp.tool()
-def script_create_version(script_id: str, description: str = "") -> dict:
+def script_create_version(scriptId: str, description: str = "") -> dict:
     """Create a new immutable version of the script."""
     service = get_script_service()
     try:
         version = service.projects().versions().create(
-            scriptId=script_id, 
+            scriptId=scriptId, 
             body={"description": description}
         ).execute()
         return version
@@ -262,12 +262,12 @@ def script_create_version(script_id: str, description: str = "") -> dict:
         return {"error": str(e)}
 
 @mcp.tool()
-def script_deploy(script_id: str, version_number: int, description: str = "") -> dict:
+def script_deploy(scriptId: str, version_number: int, description: str = "") -> dict:
     """Deploy a version of the script as an API executable."""
     service = get_script_service()
     try:
         deployment = service.projects().deployments().create(
-            scriptId=script_id,
+            scriptId=scriptId,
             body={
                 "versionNumber": version_number,
                 "description": description,
@@ -282,7 +282,7 @@ def script_deploy(script_id: str, version_number: int, description: str = "") ->
 # -- Google Sheets Tools -------------------------------------------------------
 
 @mcp.tool()
-def sheets_read_values(spreadsheet_id: str, range: str) -> dict:
+def sheets_read_values(spreadsheetId: str, range: str) -> dict:
     """
     Read values from a specific range in a Google Sheet.
     Returns: {"values": [[row1_col1, row1_col2], ...]}
@@ -290,13 +290,13 @@ def sheets_read_values(spreadsheet_id: str, range: str) -> dict:
     service = get_sheets_service()
     try:
         result = service.spreadsheets().values().get(
-            spreadsheetId=spreadsheet_id, range=range).execute()
+            spreadsheetId=spreadsheetId, range=range).execute()
         return {"values": result.get('values', [])}
     except HttpError as e:
         return {"error": str(e)}
 
 @mcp.tool()
-def sheets_update_values(spreadsheet_id: str, range: str, values: List[List[Any]]) -> dict:
+def sheets_update_values(spreadsheetId: str, range: str, values: List[List[Any]]) -> dict:
     """
     Update values in a specific range.
     Note: The input range is treated as the starting point.
@@ -307,14 +307,14 @@ def sheets_update_values(spreadsheet_id: str, range: str, values: List[List[Any]
     }
     try:
         result = service.spreadsheets().values().update(
-            spreadsheetId=spreadsheet_id, range=range,
+            spreadsheetId=spreadsheetId, range=range,
             valueInputOption="USER_ENTERED", body=body).execute()
         return result
     except HttpError as e:
         return {"error": str(e)}
 
 @mcp.tool()
-def sheets_append_values(spreadsheet_id: str, range: str, values: List[List[Any]]) -> dict:
+def sheets_append_values(spreadsheetId: str, range: str, values: List[List[Any]]) -> dict:
     """
     Append values to a sheet (after the last content in the range).
     Useful for adding new rows like adjustments.
@@ -325,18 +325,18 @@ def sheets_append_values(spreadsheet_id: str, range: str, values: List[List[Any]
     }
     try:
         result = service.spreadsheets().values().append(
-            spreadsheetId=spreadsheet_id, range=range,
+            spreadsheetId=spreadsheetId, range=range,
             valueInputOption="USER_ENTERED", body=body).execute()
         return result
     except HttpError as e:
         return {"error": str(e)}
 
 @mcp.tool()
-def sheets_get_info(spreadsheet_id: str) -> dict:
+def sheets_get_info(spreadsheetId: str) -> dict:
     """Get information about the spreadsheet (sheets, properties)."""
     service = get_sheets_service()
     try:
-        spreadsheet = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+        spreadsheet = service.spreadsheets().get(spreadsheetId=spreadsheetId).execute()
         return spreadsheet
     except HttpError as e:
         return {"error": str(e)}
