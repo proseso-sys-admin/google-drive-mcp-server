@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Google Drive MCP Server - Cloud Run HTTP edition.
+Google Drive & Apps Script MCP Server - Cloud Run HTTP edition.
 
 Credentials are loaded from environment variables (set via Cloud Run secrets):
   GOOGLE_APPLICATION_CREDENTIALS_JSON - JSON string of the service account key
@@ -13,7 +13,7 @@ Run locally:
 import json
 import os
 import io
-from typing import Any, Optional
+from typing import Any, Optional, Dict, List
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.server import TransportSecuritySettings
@@ -23,30 +23,43 @@ from starlette.responses import PlainTextResponse
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
+from googleapiclient.errors import HttpError
 
 # -- Config --------------------------------------------------------------------
 
 MCP_SECRET = os.environ.get("MCP_SECRET", "")
-SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
+SCOPES = [
+    'https://www.googleapis.com/auth/drive',           # Full Drive access (needed for some Script ops)
+    'https://www.googleapis.com/auth/script.projects', # Read/Write script projects
+    'https://www.googleapis.com/auth/script.processes' # List processes
+    # Note: script.run is needed for execution, but often requires specific deployment config
+]
+
+def get_creds():
+    creds_json = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+    if not creds_json:
+        print("Warning: GOOGLE_APPLICATION_CREDENTIALS_JSON not set. Using default credentials.")
+        return None
+    try:
+        service_account_info = json.loads(creds_json)
+        return service_account.Credentials.from_service_account_info(
+            service_account_info, scopes=SCOPES)
+    except Exception as e:
+        raise ValueError(f"Failed to load credentials: {str(e)}")
 
 def get_drive_service():
     """Authenticates and returns the Google Drive service."""
-    creds_json = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
-    
-    if not creds_json:
-        # Fallback to default credentials if no JSON provided (e.g. Workload Identity)
-        # However, for Drive, explicit credentials are often needed unless using domain-wide delegation
-        # This is a basic scaffold, assuming SA key or ADC.
-        print("Warning: GOOGLE_APPLICATION_CREDENTIALS_JSON not set. Using default credentials.")
+    creds = get_creds()
+    if not creds:
         return build('drive', 'v3')
+    return build('drive', 'v3', credentials=creds)
 
-    try:
-        service_account_info = json.loads(creds_json)
-        creds = service_account.Credentials.from_service_account_info(
-            service_account_info, scopes=SCOPES)
-        return build('drive', 'v3', credentials=creds)
-    except Exception as e:
-        raise ValueError(f"Failed to load credentials: {str(e)}")
+def get_script_service():
+    """Authenticates and returns the Google Apps Script service."""
+    creds = get_creds()
+    if not creds:
+        return build('script', 'v1')
+    return build('script', 'v1', credentials=creds)
 
 # -- MCP Server ----------------------------------------------------------------
 
@@ -59,6 +72,8 @@ mcp = FastMCP(
         enable_dns_rebinding_protection=False
     ),
 )
+
+# -- Drive Tools ---------------------------------------------------------------
 
 @mcp.tool()
 def list_files(
@@ -119,6 +134,9 @@ def download_file(file_id: str) -> str:
     elif mime_type == 'application/vnd.google-apps.spreadsheet':
         # Export Sheets to CSV
         request = service.files().export_media(fileId=file_id, mimeType='text/csv')
+    elif mime_type == 'application/vnd.google-apps.script':
+        # JSON export for scripts
+        request = service.files().export_media(fileId=file_id, mimeType='application/vnd.google-apps.script+json')
     elif mime_type.startswith('application/vnd.google-apps.'):
         return f"File type {mime_type} export not yet supported in this scaffold."
     else:
@@ -136,6 +154,107 @@ def download_file(file_id: str) -> str:
         return fh.read().decode('utf-8')
     except UnicodeDecodeError:
         return "<Binary Content - Cannot display as text>"
+
+# -- Apps Script Tools ---------------------------------------------------------
+
+@mcp.tool()
+def script_get_content(script_id: str) -> dict:
+    """
+    Get the content (code files) of a Google Apps Script project.
+    Returns a list of files with their source code.
+    """
+    service = get_script_service()
+    try:
+        content = service.projects().getContent(scriptId=script_id).execute()
+        return content
+    except HttpError as e:
+        return {"error": str(e)}
+
+@mcp.tool()
+def script_update_content(script_id: str, files: List[Dict[str, Any]]) -> dict:
+    """
+    Update the content (code files) of a Google Apps Script project.
+    
+    Args:
+        script_id: The ID of the script project.
+        files: A list of file objects. Each object must have 'name', 'type', and 'source'.
+               Type can be 'SERVER_JS', 'HTML', 'JSON'.
+               
+    Example file object:
+    {
+      "name": "Code",
+      "type": "SERVER_JS",
+      "source": "function myFunction() { console.log('Hello'); }"
+    }
+    """
+    service = get_script_service()
+    try:
+        # First get existing content to preserve manifest if not provided
+        request = {"files": files}
+        result = service.projects().updateContent(scriptId=script_id, body=request).execute()
+        return result
+    except HttpError as e:
+        return {"error": str(e)}
+
+@mcp.tool()
+def script_run_function(script_id: str, function_name: str, parameters: List[Any] = [], dev_mode: bool = False) -> dict:
+    """
+    Execute a function in a Google Apps Script project.
+    
+    IMPORTANT: 
+    1. The script must be deployed as an "API Executable".
+    2. The Service Account must have access to the script.
+    
+    Args:
+        script_id: The script ID.
+        function_name: The name of the function to run.
+        parameters: List of parameters to pass to the function.
+        dev_mode: If true, runs the HEAD version (requires editor access). If false, runs the deployed version.
+    """
+    service = get_script_service()
+    
+    request = {
+        "function": function_name,
+        "parameters": parameters,
+        "devMode": dev_mode
+    }
+    
+    try:
+        response = service.scripts().run(scriptId=script_id, body=request).execute()
+        return response
+    except HttpError as e:
+        return {"error": str(e)}
+
+@mcp.tool()
+def script_create_version(script_id: str, description: str = "") -> dict:
+    """Create a new immutable version of the script."""
+    service = get_script_service()
+    try:
+        version = service.projects().versions().create(
+            scriptId=script_id, 
+            body={"description": description}
+        ).execute()
+        return version
+    except HttpError as e:
+        return {"error": str(e)}
+
+@mcp.tool()
+def script_deploy(script_id: str, version_number: int, description: str = "") -> dict:
+    """Deploy a version of the script as an API executable."""
+    service = get_script_service()
+    try:
+        deployment = service.projects().deployments().create(
+            scriptId=script_id,
+            body={
+                "versionNumber": version_number,
+                "description": description,
+                # Note: Only manifest-based deployments are fully supported via API now, 
+                # but this endpoint creates a deployment resource.
+            }
+        ).execute()
+        return deployment
+    except HttpError as e:
+        return {"error": str(e)}
 
 # -- Health check --------------------------------------------------------------
 
