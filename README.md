@@ -12,7 +12,7 @@ A Model Context Protocol (MCP) server for Google Drive, running on Cloud Run.
 
 The server requires the following environment variables (configured via Cloud Run secrets):
 
-- `GOOGLE_APPLICATION_CREDENTIALS_JSON`: The content of your Service Account JSON key.
+- `GOOGLE_APPLICATION_CREDENTIALS_JSON`: The content of your Service Account JSON key (for `google-drive-mcp-sa@odoo-ocr-487104.iam.gserviceaccount.com`).
 - `MCP_SECRET`: A secret string to protect the endpoint (optional but recommended).
 
 ## Deployment
