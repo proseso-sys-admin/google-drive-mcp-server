@@ -171,7 +171,7 @@ def script_get_content(script_id: str) -> dict:
         return {"error": str(e)}
 
 @mcp.tool()
-def script_update_content(script_id: str, files: List[Dict[str, Any]]) -> dict:
+def script_update_content(script_id: str, files: List[Dict[str, Any]], merge: bool = True) -> dict:
     """
     Update the content (code files) of a Google Apps Script project.
     
@@ -179,6 +179,8 @@ def script_update_content(script_id: str, files: List[Dict[str, Any]]) -> dict:
         script_id: The ID of the script project.
         files: A list of file objects. Each object must have 'name', 'type', and 'source'.
                Type can be 'SERVER_JS', 'HTML', 'JSON'.
+        merge: If True (default), merges with existing files (updating matches, adding new).
+               If False, REPLACES ALL CONTENT with the provided files (dangerous).
                
     Example file object:
     {
@@ -189,8 +191,22 @@ def script_update_content(script_id: str, files: List[Dict[str, Any]]) -> dict:
     """
     service = get_script_service()
     try:
-        # First get existing content to preserve manifest if not provided
-        request = {"files": files}
+        final_files = []
+        
+        if merge:
+            # Get existing content to merge
+            current_content = service.projects().getContent(scriptId=script_id).execute()
+            current_files_map = {f['name']: f for f in current_content.get('files', [])}
+            
+            # Update with new files
+            for f in files:
+                current_files_map[f['name']] = f
+                
+            final_files = list(current_files_map.values())
+        else:
+            final_files = files
+
+        request = {"files": final_files}
         result = service.projects().updateContent(scriptId=script_id, body=request).execute()
         return result
     except HttpError as e:
