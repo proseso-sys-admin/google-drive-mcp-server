@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Google Drive & Apps Script MCP Server - Cloud Run HTTP edition.
+Google Drive, Apps Script & Sheets MCP Server - Cloud Run HTTP edition.
 
 Credentials are loaded from environment variables (set via Cloud Run secrets):
   GOOGLE_APPLICATION_CREDENTIALS_JSON - JSON string of the service account key
@@ -29,10 +29,10 @@ from googleapiclient.errors import HttpError
 
 MCP_SECRET = os.environ.get("MCP_SECRET", "")
 SCOPES = [
-    'https://www.googleapis.com/auth/drive',           # Full Drive access (needed for some Script ops)
+    'https://www.googleapis.com/auth/drive',           # Full Drive access
     'https://www.googleapis.com/auth/script.projects', # Read/Write script projects
-    'https://www.googleapis.com/auth/script.processes' # List processes
-    # Note: script.run is needed for execution, but often requires specific deployment config
+    'https://www.googleapis.com/auth/script.processes', # List processes
+    'https://www.googleapis.com/auth/spreadsheets'     # Read/Write Google Sheets
 ]
 
 def get_creds():
@@ -60,6 +60,13 @@ def get_script_service():
     if not creds:
         return build('script', 'v1')
     return build('script', 'v1', credentials=creds)
+
+def get_sheets_service():
+    """Authenticates and returns the Google Sheets service."""
+    creds = get_creds()
+    if not creds:
+        return build('sheets', 'v4')
+    return build('sheets', 'v4', credentials=creds)
 
 # -- MCP Server ----------------------------------------------------------------
 
@@ -269,6 +276,68 @@ def script_deploy(script_id: str, version_number: int, description: str = "") ->
             }
         ).execute()
         return deployment
+    except HttpError as e:
+        return {"error": str(e)}
+
+# -- Google Sheets Tools -------------------------------------------------------
+
+@mcp.tool()
+def sheets_read_values(spreadsheet_id: str, range: str) -> dict:
+    """
+    Read values from a specific range in a Google Sheet.
+    Returns: {"values": [[row1_col1, row1_col2], ...]}
+    """
+    service = get_sheets_service()
+    try:
+        result = service.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id, range=range).execute()
+        return {"values": result.get('values', [])}
+    except HttpError as e:
+        return {"error": str(e)}
+
+@mcp.tool()
+def sheets_update_values(spreadsheet_id: str, range: str, values: List[List[Any]]) -> dict:
+    """
+    Update values in a specific range.
+    Note: The input range is treated as the starting point.
+    """
+    service = get_sheets_service()
+    body = {
+        'values': values
+    }
+    try:
+        result = service.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id, range=range,
+            valueInputOption="USER_ENTERED", body=body).execute()
+        return result
+    except HttpError as e:
+        return {"error": str(e)}
+
+@mcp.tool()
+def sheets_append_values(spreadsheet_id: str, range: str, values: List[List[Any]]) -> dict:
+    """
+    Append values to a sheet (after the last content in the range).
+    Useful for adding new rows like adjustments.
+    """
+    service = get_sheets_service()
+    body = {
+        'values': values
+    }
+    try:
+        result = service.spreadsheets().values().append(
+            spreadsheetId=spreadsheet_id, range=range,
+            valueInputOption="USER_ENTERED", body=body).execute()
+        return result
+    except HttpError as e:
+        return {"error": str(e)}
+
+@mcp.tool()
+def sheets_get_info(spreadsheet_id: str) -> dict:
+    """Get information about the spreadsheet (sheets, properties)."""
+    service = get_sheets_service()
+    try:
+        spreadsheet = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+        return spreadsheet
     except HttpError as e:
         return {"error": str(e)}
 
