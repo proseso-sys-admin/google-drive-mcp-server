@@ -13,10 +13,12 @@ Run locally:
 import json
 import os
 import io
+import logging
 from typing import Any, Optional, Dict, List
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.server import TransportSecuritySettings
+from mcp.server.session import ServerSession, InitializationState
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse
 
@@ -24,6 +26,25 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from googleapiclient.errors import HttpError
+
+# -- Patch: auto-initialize SSE sessions on first request ----------------------
+# Works around https://github.com/modelcontextprotocol/python-sdk/issues/423
+# When SSE drops and the client reconnects, the server-side session is new and
+# hasn't completed the initialize handshake yet. The client sends tool calls
+# immediately, which fail with "Received request before initialization was
+# complete".  This patch auto-promotes the session to Initialized.
+
+_original_received_request = ServerSession._received_request
+
+async def _patched_received_request(self, responder):
+    if self._initialization_state != InitializationState.Initialized:
+        import mcp.types as _types
+        if not isinstance(responder.request.root, (_types.InitializeRequest, _types.PingRequest)):
+            logging.warning("Auto-initializing MCP session on first request (SSE reconnect workaround)")
+            self._initialization_state = InitializationState.Initialized
+    return await _original_received_request(self, responder)
+
+ServerSession._received_request = _patched_received_request
 
 # -- Config --------------------------------------------------------------------
 
@@ -1932,4 +1953,5 @@ async def healthz(request: Request) -> PlainTextResponse:
 # -- Entry point ---------------------------------------------------------------
 
 if __name__ == "__main__":
-    mcp.run(transport="sse")
+    transport = os.environ.get("MCP_TRANSPORT", "sse")
+    mcp.run(transport=transport)
