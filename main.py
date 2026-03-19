@@ -3514,6 +3514,13 @@ def gmail_delete_delegate(delegateEmail: str) -> dict:
 _OAUTH_STATE_TTL = 600  # 10 min for user to complete the Google login page
 
 
+def _server_origin(request: Request) -> str:
+    """Return the server's public base URL, honouring X-Forwarded-Proto from Cloud Run's LB."""
+    proto = request.headers.get('x-forwarded-proto', request.url.scheme)
+    host = request.url.netloc
+    return f"{proto}://{host}"
+
+
 def _hmac_sign(data: str, secret: str) -> str:
     """HMAC-SHA256 sign a string; return base64url-encoded digest (no padding)."""
     sig = hmac.new(secret.encode(), data.encode(), hashlib.sha256).digest()
@@ -3566,7 +3573,7 @@ async def oauth_authorize(request: Request) -> RedirectResponse:
     code_challenge = request.query_params.get('code_challenge', '')
     code_challenge_method = request.query_params.get('code_challenge_method', 'S256')
 
-    server_origin = str(request.base_url).rstrip('/')
+    server_origin = _server_origin(request)
     callback_uri = f"{server_origin}/oauth/callback"
 
     state_payload = {
@@ -3632,7 +3639,7 @@ async def oauth_callback(request: Request):
         return JSONResponse({'error': 'invalid_request', 'error_description': str(e)}, status_code=400)
 
     # Embed the Google code + PKCE challenge in a signed token we pass to Claude.ai as "code"
-    server_origin = str(request.base_url).rstrip('/')
+    server_origin = _server_origin(request)
     callback_uri = f"{server_origin}/oauth/callback"
     code_payload = {
         'google_code': google_code,
