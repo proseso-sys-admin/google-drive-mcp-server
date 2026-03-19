@@ -185,6 +185,14 @@ mcp = FastMCP(
         enable_dns_rebinding_protection=False
     ),
 )
+gmail_mcp = FastMCP(
+    "gmail",
+    host="0.0.0.0",
+    port=_port,
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=False
+    ),
+)
 
 # -- Drive Tools ---------------------------------------------------------------
 
@@ -2111,7 +2119,7 @@ def _build_raw_message(
 
 # -- Gmail: Group A — Profile --------------------------------------------------
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_get_profile() -> dict:
     """
     Get the current user's Gmail profile.
@@ -2127,7 +2135,7 @@ def gmail_get_profile() -> dict:
 
 # -- Gmail: Group B — Labels ---------------------------------------------------
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_list_labels() -> dict:
     """List all Gmail labels (both system labels and user-created labels)."""
     service = get_gmail_service()
@@ -2137,7 +2145,7 @@ def gmail_list_labels() -> dict:
         return {"error": str(e)}
 
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_get_label(labelId: str) -> dict:
     """
     Get details for a specific Gmail label.
@@ -2152,7 +2160,7 @@ def gmail_get_label(labelId: str) -> dict:
         return {"error": str(e)}
 
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_create_label(
     name: str,
     label_list_visibility: str = 'labelShow',
@@ -2188,7 +2196,7 @@ def gmail_create_label(
         return {"error": str(e)}
 
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_update_label(
     labelId: str,
     name: str = '',
@@ -2228,7 +2236,7 @@ def gmail_update_label(
         return {"error": str(e)}
 
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_delete_label(labelId: str) -> dict:
     """
     Permanently delete a user-created Gmail label.
@@ -2246,7 +2254,7 @@ def gmail_delete_label(labelId: str) -> dict:
 
 # -- Gmail: Group C — Messages -------------------------------------------------
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_list_messages(
     query: str = '',
     max_results: int = 10,
@@ -2282,7 +2290,7 @@ def gmail_list_messages(
         return {"error": str(e)}
 
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_get_message(messageId: str, format: str = 'full') -> dict:
     """
     Get a Gmail message with decoded headers and body.
@@ -2313,7 +2321,7 @@ def gmail_get_message(messageId: str, format: str = 'full') -> dict:
         return {"error": str(e)}
 
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_send_message(
     to: str,
     subject: str,
@@ -2348,7 +2356,7 @@ def gmail_send_message(
         return {"error": str(e)}
 
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_reply_to_message(
     messageId: str,
     body: str,
@@ -2394,7 +2402,7 @@ def gmail_reply_to_message(
         return {"error": str(e)}
 
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_trash_message(messageId: str) -> dict:
     """
     Move a Gmail message to Trash (reversible).
@@ -2409,7 +2417,7 @@ def gmail_trash_message(messageId: str) -> dict:
         return {"error": str(e)}
 
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_untrash_message(messageId: str) -> dict:
     """
     Restore a Gmail message from Trash.
@@ -2424,7 +2432,7 @@ def gmail_untrash_message(messageId: str) -> dict:
         return {"error": str(e)}
 
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_delete_message(messageId: str) -> dict:
     """
     Permanently delete a Gmail message (irreversible).
@@ -2440,7 +2448,7 @@ def gmail_delete_message(messageId: str) -> dict:
         return {"error": str(e)}
 
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_modify_message_labels(
     messageId: str,
     add_label_ids: List[str] = [],
@@ -2464,7 +2472,7 @@ def gmail_modify_message_labels(
         return {"error": str(e)}
 
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_mark_read(messageId: str) -> dict:
     """
     Mark a Gmail message as read (removes UNREAD label).
@@ -2475,7 +2483,7 @@ def gmail_mark_read(messageId: str) -> dict:
     return gmail_modify_message_labels(messageId, remove_label_ids=['UNREAD'])
 
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_mark_unread(messageId: str) -> dict:
     """
     Mark a Gmail message as unread (adds UNREAD label).
@@ -2488,7 +2496,7 @@ def gmail_mark_unread(messageId: str) -> dict:
 
 # -- Gmail: Group D — Threads --------------------------------------------------
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_list_threads(
     query: str = '',
     max_results: int = 10,
@@ -2524,7 +2532,7 @@ def gmail_list_threads(
         return {"error": str(e)}
 
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_get_thread(threadId: str, format: str = 'full') -> dict:
     """
     Get all messages in a Gmail thread with decoded headers.
@@ -2559,7 +2567,7 @@ def gmail_get_thread(threadId: str, format: str = 'full') -> dict:
         return {"error": str(e)}
 
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_modify_thread_labels(
     threadId: str,
     add_label_ids: List[str] = [],
@@ -2583,7 +2591,7 @@ def gmail_modify_thread_labels(
         return {"error": str(e)}
 
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_trash_thread(threadId: str) -> dict:
     """
     Move an entire Gmail thread to Trash (reversible).
@@ -2598,7 +2606,7 @@ def gmail_trash_thread(threadId: str) -> dict:
         return {"error": str(e)}
 
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_untrash_thread(threadId: str) -> dict:
     """
     Restore an entire Gmail thread from Trash.
@@ -2613,7 +2621,7 @@ def gmail_untrash_thread(threadId: str) -> dict:
         return {"error": str(e)}
 
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_delete_thread(threadId: str) -> dict:
     """
     Permanently delete an entire Gmail thread (irreversible).
@@ -2631,7 +2639,7 @@ def gmail_delete_thread(threadId: str) -> dict:
 
 # -- Gmail: Group E — Drafts ---------------------------------------------------
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_list_drafts(
     max_results: int = 10,
     page_token: str = '',
@@ -2653,7 +2661,7 @@ def gmail_list_drafts(
         return {"error": str(e)}
 
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_get_draft(draftId: str) -> dict:
     """
     Get a Gmail draft with decoded headers and body.
@@ -2681,7 +2689,7 @@ def gmail_get_draft(draftId: str) -> dict:
         return {"error": str(e)}
 
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_create_draft(
     to: str,
     subject: str,
@@ -2711,7 +2719,7 @@ def gmail_create_draft(
         return {"error": str(e)}
 
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_update_draft(
     draftId: str,
     to: str,
@@ -2743,7 +2751,7 @@ def gmail_update_draft(
         return {"error": str(e)}
 
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_send_draft(draftId: str) -> dict:
     """
     Send an existing Gmail draft.
@@ -2760,7 +2768,7 @@ def gmail_send_draft(draftId: str) -> dict:
         return {"error": str(e)}
 
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_delete_draft(draftId: str) -> dict:
     """
     Discard (permanently delete) a Gmail draft.
@@ -2778,7 +2786,7 @@ def gmail_delete_draft(draftId: str) -> dict:
 
 # -- Gmail: Group F — Attachments ----------------------------------------------
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_get_attachment(messageId: str, attachmentId: str) -> dict:
     """
     Retrieve a Gmail attachment as base64url-encoded data.
@@ -2800,7 +2808,7 @@ def gmail_get_attachment(messageId: str, attachmentId: str) -> dict:
 
 # -- Gmail: Group G — Batch operations & import --------------------------------
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_batch_delete_messages(message_ids: List[str]) -> dict:
     """
     Permanently delete multiple Gmail messages in one API call.
@@ -2818,7 +2826,7 @@ def gmail_batch_delete_messages(message_ids: List[str]) -> dict:
         return {"error": str(e)}
 
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_batch_modify_messages(
     message_ids: List[str],
     add_label_ids: List[str] = [],
@@ -2847,7 +2855,7 @@ def gmail_batch_modify_messages(
         return {"error": str(e)}
 
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_insert_message(
     raw: str,
     label_ids: List[str] = [],
@@ -2875,7 +2883,7 @@ def gmail_insert_message(
         return {"error": str(e)}
 
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_import_message(
     raw: str,
     label_ids: List[str] = [],
@@ -2908,7 +2916,7 @@ def gmail_import_message(
 
 # -- Gmail: Group H — History --------------------------------------------------
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_list_history(
     start_history_id: str,
     max_results: int = 100,
@@ -2946,7 +2954,7 @@ def gmail_list_history(
 
 # -- Gmail: Group I — Push notifications ---------------------------------------
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_watch(
     topic_name: str,
     label_ids: List[str] = [],
@@ -2975,7 +2983,7 @@ def gmail_watch(
         return {"error": str(e)}
 
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_stop_watch() -> dict:
     """Stop receiving Gmail push notifications for the current user."""
     service = get_gmail_service()
@@ -2988,7 +2996,7 @@ def gmail_stop_watch() -> dict:
 
 # -- Gmail: Group J — Settings: Basic ------------------------------------------
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_get_auto_forwarding() -> dict:
     """Get the auto-forwarding configuration for the Gmail account."""
     service = get_gmail_service()
@@ -2998,7 +3006,7 @@ def gmail_get_auto_forwarding() -> dict:
         return {"error": str(e)}
 
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_update_auto_forwarding(
     enabled: bool,
     email_address: str = '',
@@ -3022,7 +3030,7 @@ def gmail_update_auto_forwarding(
         return {"error": str(e)}
 
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_get_imap() -> dict:
     """Get the IMAP settings for the Gmail account."""
     service = get_gmail_service()
@@ -3032,7 +3040,7 @@ def gmail_get_imap() -> dict:
         return {"error": str(e)}
 
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_update_imap(
     enabled: bool,
     auto_expunge: bool = True,
@@ -3061,7 +3069,7 @@ def gmail_update_imap(
         return {"error": str(e)}
 
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_get_language() -> dict:
     """Get the display language setting for the Gmail account."""
     service = get_gmail_service()
@@ -3071,7 +3079,7 @@ def gmail_get_language() -> dict:
         return {"error": str(e)}
 
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_update_language(display_language: str) -> dict:
     """
     Set the display language for the Gmail account.
@@ -3088,7 +3096,7 @@ def gmail_update_language(display_language: str) -> dict:
         return {"error": str(e)}
 
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_get_pop() -> dict:
     """Get the POP settings for the Gmail account."""
     service = get_gmail_service()
@@ -3098,7 +3106,7 @@ def gmail_get_pop() -> dict:
         return {"error": str(e)}
 
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_update_pop(
     access_window: str = 'disabled',
     disposition: str = 'leaveInInbox',
@@ -3119,7 +3127,7 @@ def gmail_update_pop(
         return {"error": str(e)}
 
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_get_vacation() -> dict:
     """Get the vacation auto-responder settings for the Gmail account."""
     service = get_gmail_service()
@@ -3129,7 +3137,7 @@ def gmail_get_vacation() -> dict:
         return {"error": str(e)}
 
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_update_vacation(
     enable_auto_reply: bool,
     response_subject: str = '',
@@ -3177,7 +3185,7 @@ def gmail_update_vacation(
 
 # -- Gmail: Group K — Settings: Filters ----------------------------------------
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_list_filters() -> dict:
     """List all Gmail message filters for the account."""
     service = get_gmail_service()
@@ -3187,7 +3195,7 @@ def gmail_list_filters() -> dict:
         return {"error": str(e)}
 
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_get_filter(filterId: str) -> dict:
     """
     Get a specific Gmail message filter.
@@ -3202,7 +3210,7 @@ def gmail_get_filter(filterId: str) -> dict:
         return {"error": str(e)}
 
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_create_filter(
     criteria: Dict[str, Any],
     action: Dict[str, Any],
@@ -3227,7 +3235,7 @@ def gmail_create_filter(
         return {"error": str(e)}
 
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_delete_filter(filterId: str) -> dict:
     """
     Delete a Gmail message filter.
@@ -3245,7 +3253,7 @@ def gmail_delete_filter(filterId: str) -> dict:
 
 # -- Gmail: Group L — Settings: Forwarding addresses ---------------------------
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_list_forwarding_addresses() -> dict:
     """List all verified forwarding addresses for the Gmail account."""
     service = get_gmail_service()
@@ -3255,7 +3263,7 @@ def gmail_list_forwarding_addresses() -> dict:
         return {"error": str(e)}
 
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_get_forwarding_address(forwardingEmail: str) -> dict:
     """
     Get a specific forwarding address and its verification status.
@@ -3272,7 +3280,7 @@ def gmail_get_forwarding_address(forwardingEmail: str) -> dict:
         return {"error": str(e)}
 
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_create_forwarding_address(forwardingEmail: str) -> dict:
     """
     Add a new forwarding address (triggers a verification email to that address).
@@ -3289,7 +3297,7 @@ def gmail_create_forwarding_address(forwardingEmail: str) -> dict:
         return {"error": str(e)}
 
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_delete_forwarding_address(forwardingEmail: str) -> dict:
     """
     Remove a forwarding address from the Gmail account.
@@ -3309,7 +3317,7 @@ def gmail_delete_forwarding_address(forwardingEmail: str) -> dict:
 
 # -- Gmail: Group M — Settings: Send-as aliases --------------------------------
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_list_send_as() -> dict:
     """List all send-as aliases for the Gmail account."""
     service = get_gmail_service()
@@ -3319,7 +3327,7 @@ def gmail_list_send_as() -> dict:
         return {"error": str(e)}
 
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_get_send_as(sendAsEmail: str) -> dict:
     """
     Get details of a specific send-as alias.
@@ -3336,7 +3344,7 @@ def gmail_get_send_as(sendAsEmail: str) -> dict:
         return {"error": str(e)}
 
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_create_send_as(
     sendAsEmail: str,
     displayName: str = '',
@@ -3370,7 +3378,7 @@ def gmail_create_send_as(
         return {"error": str(e)}
 
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_update_send_as(
     sendAsEmail: str,
     displayName: str = '',
@@ -3406,7 +3414,7 @@ def gmail_update_send_as(
         return {"error": str(e)}
 
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_delete_send_as(sendAsEmail: str) -> dict:
     """
     Remove a send-as alias from the Gmail account.
@@ -3424,7 +3432,7 @@ def gmail_delete_send_as(sendAsEmail: str) -> dict:
         return {"error": str(e)}
 
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_verify_send_as(sendAsEmail: str) -> dict:
     """
     Re-send the verification email for a send-as alias.
@@ -3444,7 +3452,7 @@ def gmail_verify_send_as(sendAsEmail: str) -> dict:
 
 # -- Gmail: Group N — Settings: Delegates --------------------------------------
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_list_delegates() -> dict:
     """List all delegates (accounts that can access this Gmail mailbox)."""
     service = get_gmail_service()
@@ -3454,7 +3462,7 @@ def gmail_list_delegates() -> dict:
         return {"error": str(e)}
 
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_get_delegate(delegateEmail: str) -> dict:
     """
     Get a delegate and their verification status.
@@ -3471,7 +3479,7 @@ def gmail_get_delegate(delegateEmail: str) -> dict:
         return {"error": str(e)}
 
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_create_delegate(delegateEmail: str) -> dict:
     """
     Add a delegate (triggers a verification email to the delegate).
@@ -3488,7 +3496,7 @@ def gmail_create_delegate(delegateEmail: str) -> dict:
         return {"error": str(e)}
 
 
-@mcp.tool()
+@gmail_mcp.tool()
 def gmail_delete_delegate(delegateEmail: str) -> dict:
     """
     Remove a delegate from the Gmail account.
@@ -3763,9 +3771,21 @@ async def healthz(request: Request) -> PlainTextResponse:
 
 if __name__ == "__main__":
     import uvicorn
+    from starlette.applications import Starlette as _Starlette
+    from starlette.routing import Mount as _Mount
+
     transport = os.environ.get("MCP_TRANSPORT", "sse")
     if transport == "sse":
-        app = mcp.sse_app()
+        # Drive / Sheets / Script at /sse  (≤62 tools — fits client limit)
+        # Gmail at /gmail/sse              (64 tools — separate connector)
+        # OAuth AS endpoints (/authorize, /oauth/callback, /token) are on the
+        # drive app and served at the root, so both connectors share them.
+        drive_app = mcp.sse_app()
+        gmail_app = gmail_mcp.sse_app()
+        app = _Starlette(routes=[
+            _Mount('/gmail', app=gmail_app),
+            _Mount('/', app=drive_app),
+        ])
         app.add_middleware(OAuthMiddleware)
         uvicorn.run(app, host="0.0.0.0", port=_port)
     else:
