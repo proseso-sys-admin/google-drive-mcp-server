@@ -137,8 +137,8 @@ def _validate_google_token(token: str) -> str:
     return email
 
 
-# Paths that don't require a Bearer token (OAuth AS endpoints + health check)
-_OAUTH_EXEMPT_PATHS = {'/healthz', '/authorize', '/oauth/callback', '/token'}
+# Paths that don't require a Bearer token (OAuth AS + discovery + health check)
+_OAUTH_EXEMPT_PATHS = {'/healthz', '/authorize', '/oauth/callback', '/token', '/register'}
 
 
 class OAuthMiddleware(BaseHTTPMiddleware):
@@ -146,11 +146,12 @@ class OAuthMiddleware(BaseHTTPMiddleware):
     Validate the Google OAuth Bearer token on every request, then store it
     in _current_access_token for the duration of the request.
 
-    OAuth AS endpoints and /healthz bypass auth.
+    OAuth AS endpoints, /.well-known/ discovery, and /healthz bypass auth.
     Returns 401 JSON for missing, invalid, or expired tokens.
     """
     async def dispatch(self, request: Request, call_next):
-        if request.url.path in _OAUTH_EXEMPT_PATHS:
+        path = request.url.path
+        if path in _OAUTH_EXEMPT_PATHS or path.startswith('/.well-known/'):
             return await call_next(request)
 
         auth_header = request.headers.get('Authorization', '')
@@ -3783,6 +3784,62 @@ async def oauth_token(request: Request) -> JSONResponse:
         )
 
     return JSONResponse(token_response)
+
+
+# -- MCP OAuth 2.0 Discovery (RFC 8414 / RFC 9470) -----------------------------
+# Claude Desktop and MCP SDK clients auto-discover OAuth endpoints via these
+# well-known URLs before attempting to open the browser for authentication.
+
+def _as_metadata(request: Request) -> dict:
+    """Build the Authorization Server metadata document."""
+    origin = _server_origin(request)
+    return {
+        "issuer": origin,
+        "authorization_endpoint": f"{origin}/authorize",
+        "token_endpoint": f"{origin}/token",
+        "registration_endpoint": f"{origin}/register",
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code"],
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["none", "client_secret_post"],
+    }
+
+
+@mcp.custom_route("/.well-known/oauth-authorization-server", methods=["GET"])
+async def oauth_as_metadata(request: Request) -> JSONResponse:
+    return JSONResponse(_as_metadata(request))
+
+
+@mcp.custom_route("/.well-known/openid-configuration", methods=["GET"])
+async def oauth_openid_config(request: Request) -> JSONResponse:
+    return JSONResponse(_as_metadata(request))
+
+
+@mcp.custom_route("/.well-known/oauth-protected-resource", methods=["GET"])
+async def oauth_protected_resource(request: Request) -> JSONResponse:
+    origin = _server_origin(request)
+    return JSONResponse({"resource": origin, "authorization_servers": [origin]})
+
+
+@mcp.custom_route("/.well-known/oauth-protected-resource/{path:path}", methods=["GET"])
+async def oauth_protected_resource_path(request: Request) -> JSONResponse:
+    origin = _server_origin(request)
+    return JSONResponse({"resource": origin, "authorization_servers": [origin]})
+
+
+@mcp.custom_route("/register", methods=["POST"])
+async def oauth_register(request: Request) -> JSONResponse:
+    """Dynamic client registration (RFC 7591) — returns a static client_id."""
+    body_bytes = await request.body()
+    body = json.loads(body_bytes) if body_bytes else {}
+    return JSONResponse({
+        "client_id": "mcp-client",
+        "client_id_issued_at": int(time.time()),
+        "redirect_uris": body.get("redirect_uris", []),
+        "grant_types": ["authorization_code"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+    }, status_code=201)
 
 
 # -- Health check --------------------------------------------------------------
