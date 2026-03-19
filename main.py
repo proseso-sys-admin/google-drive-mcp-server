@@ -3514,6 +3514,30 @@ def gmail_delete_delegate(delegateEmail: str) -> dict:
         return {"error": str(e)}
 
 
+# -- Gmail ASGI dispatcher -----------------------------------------------------
+
+class _GmailDispatcher:
+    """
+    Pure ASGI router: strips /gmail prefix and forwards to gmail_app.
+    Everything else goes to drive_app unchanged.
+    Avoids Starlette Mount's path-stripping bug with the root prefix.
+    """
+    def __init__(self, drive_app, gmail_app):
+        self._drive = drive_app
+        self._gmail = gmail_app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get('type') in ('http', 'websocket'):
+            path = scope.get('path', '')
+            if path == '/gmail' or path.startswith('/gmail/'):
+                scope = dict(scope)
+                scope['path'] = path[6:] or '/'
+                scope['root_path'] = scope.get('root_path', '') + '/gmail'
+                await self._gmail(scope, receive, send)
+                return
+        await self._drive(scope, receive, send)
+
+
 # -- OAuth Authorization Server proxy -----------------------------------------
 # Claude.ai's connector OAuth flow treats the MCP server as a full OAuth AS.
 # These three endpoints proxy Google OAuth behind a PKCE-verified exchange.
@@ -3771,19 +3795,14 @@ async def healthz(request: Request) -> PlainTextResponse:
 
 if __name__ == "__main__":
     import uvicorn
-    from starlette.routing import Mount as _Mount
 
     transport = os.environ.get("MCP_TRANSPORT", "sse")
     if transport == "sse":
         # Drive / Sheets / Script at /sse  (≤62 tools — fits client limit)
         # Gmail at /gmail/sse              (64 tools — separate connector)
-        # Inject the gmail mount into the drive app's router so the drive
-        # app's own routes (/sse, /healthz, /authorize, etc.) keep their
-        # full paths and aren't broken by Starlette's Mount path-stripping.
         drive_app = mcp.sse_app()
         gmail_app = gmail_mcp.sse_app()
-        drive_app.router.routes.insert(0, _Mount('/gmail', app=gmail_app))
-        drive_app.add_middleware(OAuthMiddleware)
-        uvicorn.run(drive_app, host="0.0.0.0", port=_port)
+        app = OAuthMiddleware(_GmailDispatcher(drive_app, gmail_app))
+        uvicorn.run(app, host="0.0.0.0", port=_port)
     else:
         mcp.run(transport=transport)
