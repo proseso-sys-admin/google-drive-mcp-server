@@ -22,7 +22,7 @@ steps:
       - 'managed'
       - '--allow-unauthenticated'
       - '--set-secrets'
-      - 'GOOGLE_APPLICATION_CREDENTIALS_JSON=google-drive-creds-json:latest'
+      - 'GOOGLE_APPLICATION_CREDENTIALS_JSON=google-drive-creds-json:latest,OAUTH_CLIENT_ID=oauth-client-id:latest,OAUTH_CLIENT_SECRET=oauth-client-secret:latest'
 
 options:
   logging: CLOUD_LOGGING_ONLY

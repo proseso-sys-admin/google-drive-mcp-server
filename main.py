@@ -31,6 +31,9 @@ import json
 import os
 import io
 import base64
+import hashlib
+import hmac
+import time
 import asyncio
 import logging
 import contextvars
@@ -46,7 +49,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.server import TransportSecuritySettings
 from mcp.server.session import ServerSession, InitializationState
 from starlette.requests import Request
-from starlette.responses import PlainTextResponse, JSONResponse
+from starlette.responses import PlainTextResponse, JSONResponse, RedirectResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from google.oauth2.credentials import Credentials as UserCredentials
@@ -134,16 +137,20 @@ def _validate_google_token(token: str) -> str:
     return email
 
 
+# Paths that don't require a Bearer token (OAuth AS endpoints + health check)
+_OAUTH_EXEMPT_PATHS = {'/healthz', '/authorize', '/oauth/callback', '/token'}
+
+
 class OAuthMiddleware(BaseHTTPMiddleware):
     """
     Validate the Google OAuth Bearer token on every request, then store it
     in _current_access_token for the duration of the request.
 
-    Health check (/healthz) bypasses auth.
+    OAuth AS endpoints and /healthz bypass auth.
     Returns 401 JSON for missing, invalid, or expired tokens.
     """
     async def dispatch(self, request: Request, call_next):
-        if request.url.path == '/healthz':
+        if request.url.path in _OAUTH_EXEMPT_PATHS:
             return await call_next(request)
 
         auth_header = request.headers.get('Authorization', '')
@@ -3497,6 +3504,246 @@ def gmail_delete_delegate(delegateEmail: str) -> dict:
         return {"deleted": True, "delegateEmail": delegateEmail}
     except HttpError as e:
         return {"error": str(e)}
+
+
+# -- OAuth Authorization Server proxy -----------------------------------------
+# Claude.ai's connector OAuth flow treats the MCP server as a full OAuth AS.
+# These three endpoints proxy Google OAuth behind a PKCE-verified exchange.
+# All state is passed as HMAC-signed tokens — no server-side storage needed.
+
+_OAUTH_STATE_TTL = 600  # 10 min for user to complete the Google login page
+
+
+def _hmac_sign(data: str, secret: str) -> str:
+    """HMAC-SHA256 sign a string; return base64url-encoded digest (no padding)."""
+    sig = hmac.new(secret.encode(), data.encode(), hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(sig).rstrip(b'=').decode()
+
+
+def _make_state_token(payload: dict, secret: str) -> str:
+    """Encode a dict as a HMAC-signed, base64url token: <data>.<sig>"""
+    data = base64.urlsafe_b64encode(json.dumps(payload).encode()).rstrip(b'=').decode()
+    sig = _hmac_sign(data, secret)
+    return f"{data}.{sig}"
+
+
+def _verify_state_token(token: str, secret: str) -> dict:
+    """Decode and verify a state token. Raises ValueError if invalid or expired."""
+    try:
+        data, sig = token.rsplit('.', 1)
+    except ValueError:
+        raise ValueError("Malformed token")
+    expected_sig = _hmac_sign(data, secret)
+    if not hmac.compare_digest(sig, expected_sig):
+        raise ValueError("Token signature mismatch")
+    padded = data + '=' * (-len(data) % 4)
+    payload = json.loads(base64.urlsafe_b64decode(padded))
+    if payload.get('exp', 0) < time.time():
+        raise ValueError("Token expired")
+    return payload
+
+
+@mcp.custom_route("/authorize", methods=["GET"])
+async def oauth_authorize(request: Request) -> RedirectResponse:
+    """
+    OAuth AS /authorize endpoint.
+
+    Claude.ai redirects the user's browser here with a code_challenge (PKCE).
+    We relay the request to Google OAuth, embedding Claude.ai's parameters in
+    a HMAC-signed state token so we can recover them in /oauth/callback without
+    any server-side storage (required for stateless Cloud Run instances).
+    """
+    client_id = os.environ.get('OAUTH_CLIENT_ID', '')
+    client_secret = os.environ.get('OAUTH_CLIENT_SECRET', '')
+    if not client_id or not client_secret:
+        return JSONResponse(
+            {'error': 'server_error', 'error_description': 'OAuth client not configured'},
+            status_code=500,
+        )
+
+    claude_state = request.query_params.get('state', '')
+    claude_redirect_uri = request.query_params.get('redirect_uri', '')
+    code_challenge = request.query_params.get('code_challenge', '')
+    code_challenge_method = request.query_params.get('code_challenge_method', 'S256')
+
+    server_origin = str(request.base_url).rstrip('/')
+    callback_uri = f"{server_origin}/oauth/callback"
+
+    state_payload = {
+        'claude_state': claude_state,
+        'claude_redirect_uri': claude_redirect_uri,
+        'code_challenge': code_challenge,
+        'code_challenge_method': code_challenge_method,
+        'exp': int(time.time()) + _OAUTH_STATE_TTL,
+    }
+    state_token = _make_state_token(state_payload, client_secret)
+
+    google_scopes = (
+        'https://www.googleapis.com/auth/drive '
+        'https://www.googleapis.com/auth/spreadsheets '
+        'https://www.googleapis.com/auth/script.projects '
+        'https://www.googleapis.com/auth/script.processes '
+        'https://mail.google.com/ '
+        'email'
+    )
+    params = urllib.parse.urlencode({
+        'response_type': 'code',
+        'client_id': client_id,
+        'redirect_uri': callback_uri,
+        'scope': google_scopes,
+        'state': state_token,
+        'access_type': 'offline',
+        'prompt': 'consent',
+    })
+    return RedirectResponse(url=f"https://accounts.google.com/o/oauth2/v2/auth?{params}")
+
+
+@mcp.custom_route("/oauth/callback", methods=["GET"])
+async def oauth_callback(request: Request):
+    """
+    OAuth callback from Google.
+
+    Unpacks the HMAC-signed state token to retrieve Claude.ai's parameters,
+    then wraps the Google authorization code in a new signed token that carries
+    the PKCE code_challenge. Redirects back to Claude.ai with our signed code.
+    """
+    client_secret = os.environ.get('OAUTH_CLIENT_SECRET', '')
+    if not client_secret:
+        return JSONResponse(
+            {'error': 'server_error', 'error_description': 'OAuth client not configured'},
+            status_code=500,
+        )
+
+    error = request.query_params.get('error', '')
+    if error:
+        return JSONResponse({'error': error}, status_code=400)
+
+    google_code = request.query_params.get('code', '')
+    state_token = request.query_params.get('state', '')
+    if not google_code or not state_token:
+        return JSONResponse(
+            {'error': 'invalid_request', 'error_description': 'Missing code or state'},
+            status_code=400,
+        )
+
+    try:
+        state = _verify_state_token(state_token, client_secret)
+    except ValueError as e:
+        return JSONResponse({'error': 'invalid_request', 'error_description': str(e)}, status_code=400)
+
+    # Embed the Google code + PKCE challenge in a signed token we pass to Claude.ai as "code"
+    server_origin = str(request.base_url).rstrip('/')
+    callback_uri = f"{server_origin}/oauth/callback"
+    code_payload = {
+        'google_code': google_code,
+        'code_challenge': state['code_challenge'],
+        'code_challenge_method': state.get('code_challenge_method', 'S256'),
+        'callback_uri': callback_uri,
+        'exp': int(time.time()) + 300,  # 5 min to complete /token exchange
+    }
+    our_code = _make_state_token(code_payload, client_secret)
+
+    redirect_params = urllib.parse.urlencode({
+        'code': our_code,
+        'state': state['claude_state'],
+    })
+    return RedirectResponse(url=f"{state['claude_redirect_uri']}?{redirect_params}")
+
+
+@mcp.custom_route("/token", methods=["POST"])
+async def oauth_token(request: Request) -> JSONResponse:
+    """
+    OAuth AS /token endpoint.
+
+    Claude.ai POSTs the code + code_verifier here. We:
+    1. Decode our signed code token to recover the Google code and code_challenge.
+    2. Verify PKCE: SHA-256(code_verifier) == code_challenge.
+    3. Exchange the Google authorization code for a Google access token.
+    4. Return the Google token response so Claude.ai uses it as a Bearer token.
+    """
+    client_id = os.environ.get('OAUTH_CLIENT_ID', '')
+    client_secret = os.environ.get('OAUTH_CLIENT_SECRET', '')
+    if not client_id or not client_secret:
+        return JSONResponse(
+            {'error': 'server_error', 'error_description': 'OAuth client not configured'},
+            status_code=500,
+        )
+
+    body_bytes = await request.body()
+    content_type = request.headers.get('content-type', '')
+    if 'application/x-www-form-urlencoded' in content_type:
+        params = dict(urllib.parse.parse_qsl(body_bytes.decode()))
+    else:
+        try:
+            params = json.loads(body_bytes) if body_bytes else {}
+        except Exception:
+            params = {}
+
+    our_code = params.get('code', '')
+    code_verifier = params.get('code_verifier', '')
+    grant_type = params.get('grant_type', '')
+
+    if grant_type != 'authorization_code':
+        return JSONResponse({'error': 'unsupported_grant_type'}, status_code=400)
+    if not our_code or not code_verifier:
+        return JSONResponse(
+            {'error': 'invalid_request', 'error_description': 'Missing code or code_verifier'},
+            status_code=400,
+        )
+
+    try:
+        code_data = _verify_state_token(our_code, client_secret)
+    except ValueError as e:
+        return JSONResponse({'error': 'invalid_grant', 'error_description': str(e)}, status_code=400)
+
+    # Verify PKCE: SHA-256(code_verifier) must equal code_challenge
+    code_challenge = code_data.get('code_challenge', '')
+    method = code_data.get('code_challenge_method', 'S256')
+    if method == 'S256':
+        digest = hashlib.sha256(code_verifier.encode()).digest()
+        computed = base64.urlsafe_b64encode(digest).rstrip(b'=').decode()
+    else:
+        computed = code_verifier  # plain method (not recommended but spec-compliant)
+
+    if not hmac.compare_digest(computed, code_challenge):
+        return JSONResponse(
+            {'error': 'invalid_grant', 'error_description': 'PKCE verification failed'},
+            status_code=400,
+        )
+
+    # Exchange the Google authorization code for Google OAuth tokens
+    google_code = code_data['google_code']
+    callback_uri = code_data['callback_uri']
+    token_body = urllib.parse.urlencode({
+        'code': google_code,
+        'client_id': client_id,
+        'client_secret': client_secret,
+        'redirect_uri': callback_uri,
+        'grant_type': 'authorization_code',
+    }).encode()
+
+    try:
+        req = urllib.request.Request(
+            'https://oauth2.googleapis.com/token',
+            data=token_body,
+            method='POST',
+            headers={'Content-Type': 'application/x-www-form-urlencoded'},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            token_response = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode()
+        return JSONResponse(
+            {'error': 'invalid_grant', 'error_description': error_body},
+            status_code=400,
+        )
+    except Exception as e:
+        return JSONResponse(
+            {'error': 'server_error', 'error_description': str(e)},
+            status_code=500,
+        )
+
+    return JSONResponse(token_response)
 
 
 # -- Health check --------------------------------------------------------------
