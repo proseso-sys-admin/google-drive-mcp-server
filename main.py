@@ -3771,22 +3771,19 @@ async def healthz(request: Request) -> PlainTextResponse:
 
 if __name__ == "__main__":
     import uvicorn
-    from starlette.applications import Starlette as _Starlette
     from starlette.routing import Mount as _Mount
 
     transport = os.environ.get("MCP_TRANSPORT", "sse")
     if transport == "sse":
         # Drive / Sheets / Script at /sse  (≤62 tools — fits client limit)
         # Gmail at /gmail/sse              (64 tools — separate connector)
-        # OAuth AS endpoints (/authorize, /oauth/callback, /token) are on the
-        # drive app and served at the root, so both connectors share them.
+        # Inject the gmail mount into the drive app's router so the drive
+        # app's own routes (/sse, /healthz, /authorize, etc.) keep their
+        # full paths and aren't broken by Starlette's Mount path-stripping.
         drive_app = mcp.sse_app()
         gmail_app = gmail_mcp.sse_app()
-        app = _Starlette(routes=[
-            _Mount('/gmail', app=gmail_app),
-            _Mount('/', app=drive_app),
-        ])
-        app.add_middleware(OAuthMiddleware)
-        uvicorn.run(app, host="0.0.0.0", port=_port)
+        drive_app.router.routes.insert(0, _Mount('/gmail', app=gmail_app))
+        drive_app.add_middleware(OAuthMiddleware)
+        uvicorn.run(drive_app, host="0.0.0.0", port=_port)
     else:
         mcp.run(transport=transport)
