@@ -1,28 +1,55 @@
 #!/usr/bin/env python3
 """
-Google Drive, Apps Script & Sheets MCP Server - Cloud Run HTTP edition.
+Google Drive, Apps Script, Sheets & Gmail MCP Server - Cloud Run HTTP edition.
 
-Credentials are loaded from environment variables (set via Cloud Run secrets):
-  GOOGLE_APPLICATION_CREDENTIALS_JSON - JSON string of the service account key
-  MCP_SECRET                          - Secret path segment for basic endpoint protection
+Authentication uses Google OAuth 2.0. The Claude team connector is configured
+with Google as the OAuth provider; each team member authenticates once with
+their own Google account, and Claude passes their access token as a Bearer
+token on every request. The server validates the token with Google and uses
+it directly to call Drive, Sheets, Script, and Gmail — no service account or
+domain-wide delegation required.
 
-Run locally:
-  MCP_SECRET=dev GOOGLE_APPLICATION_CREDENTIALS_JSON='{...}' python main.py
+Required environment variable (set via Cloud Run secret):
+  GOOGLE_APPLICATION_CREDENTIALS_JSON - still used for any service-account-
+                                        level operations (optional if all
+                                        access is via user OAuth tokens)
+
+OAuth scopes to request in the Google Cloud OAuth client:
+  https://www.googleapis.com/auth/drive
+  https://www.googleapis.com/auth/spreadsheets
+  https://www.googleapis.com/auth/script.projects
+  https://www.googleapis.com/auth/script.processes
+  https://mail.google.com/
+  email (to identify the user in logs)
+
+Run locally (supply a valid Google OAuth access token for testing):
+  GOOGLE_OAUTH_TOKEN='ya29.xxx' python main.py
+  # Connect MCP client to: http://localhost:8080/sse
 """
 
 import json
 import os
 import io
+import base64
+import asyncio
 import logging
+import contextvars
+import urllib.request
+import urllib.parse
+import urllib.error
+import email.mime.text
+import email.mime.multipart
+import email.mime.base
 from typing import Any, Optional, Dict, List
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.server import TransportSecuritySettings
 from mcp.server.session import ServerSession, InitializationState
 from starlette.requests import Request
-from starlette.responses import PlainTextResponse
+from starlette.responses import PlainTextResponse, JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 
-from google.oauth2 import service_account
+from google.oauth2.credentials import Credentials as UserCredentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from googleapiclient.errors import HttpError
@@ -48,46 +75,97 @@ ServerSession._received_request = _patched_received_request
 
 # -- Config --------------------------------------------------------------------
 
-MCP_SECRET = os.environ.get("MCP_SECRET", "")
-SCOPES = [
-    'https://www.googleapis.com/auth/drive',           # Full Drive access
-    'https://www.googleapis.com/auth/script.projects', # Read/Write script projects
-    'https://www.googleapis.com/auth/script.processes', # List processes
-    'https://www.googleapis.com/auth/spreadsheets'     # Read/Write Google Sheets
-]
+# Per-request Google OAuth access token — set by OAuthMiddleware, read by get_creds().
+# ContextVar ensures concurrent requests from different users never bleed into each other.
+_current_access_token: contextvars.ContextVar[str] = contextvars.ContextVar(
+    'current_access_token', default=''
+)
 
-def get_creds():
-    creds_json = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
-    if not creds_json:
-        print("Warning: GOOGLE_APPLICATION_CREDENTIALS_JSON not set. Using default credentials.")
-        return None
-    try:
-        service_account_info = json.loads(creds_json)
-        return service_account.Credentials.from_service_account_info(
-            service_account_info, scopes=SCOPES)
-    except Exception as e:
-        raise ValueError(f"Failed to load credentials: {str(e)}")
+def get_creds() -> UserCredentials:
+    """Return Google OAuth credentials for the current authenticated user."""
+    token = _current_access_token.get()
+    if not token:
+        raise ValueError(
+            "No authenticated user. Connect the Claude connector via Google OAuth."
+        )
+    return UserCredentials(token=token)
 
 def get_drive_service():
     """Authenticates and returns the Google Drive service."""
-    creds = get_creds()
-    if not creds:
-        return build('drive', 'v3')
-    return build('drive', 'v3', credentials=creds)
+    return build('drive', 'v3', credentials=get_creds())
 
 def get_script_service():
     """Authenticates and returns the Google Apps Script service."""
-    creds = get_creds()
-    if not creds:
-        return build('script', 'v1')
-    return build('script', 'v1', credentials=creds)
+    return build('script', 'v1', credentials=get_creds())
 
 def get_sheets_service():
     """Authenticates and returns the Google Sheets service."""
-    creds = get_creds()
-    if not creds:
-        return build('sheets', 'v4')
-    return build('sheets', 'v4', credentials=creds)
+    return build('sheets', 'v4', credentials=get_creds())
+
+def get_gmail_service():
+    """Authenticates and returns the Gmail API service."""
+    return build('gmail', 'v1', credentials=get_creds())
+
+# -- Auth middleware -----------------------------------------------------------
+
+def _validate_google_token(token: str) -> str:
+    """
+    Validate a Google OAuth access token via the tokeninfo endpoint.
+    Returns the user's email on success. Raises ValueError on failure.
+    Runs synchronously — call via asyncio.to_thread in async contexts.
+    """
+    url = 'https://oauth2.googleapis.com/tokeninfo?' + urllib.parse.urlencode(
+        {'access_token': token}
+    )
+    try:
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError:
+        raise ValueError("Invalid or expired token")
+    except Exception as e:
+        raise ValueError(f"Token validation failed: {e}")
+
+    email = data.get('email', '')
+    if not email:
+        raise ValueError(
+            "Token is missing the 'email' scope — ensure the OAuth client "
+            "requests the 'email' scope"
+        )
+    return email
+
+
+class OAuthMiddleware(BaseHTTPMiddleware):
+    """
+    Validate the Google OAuth Bearer token on every request, then store it
+    in _current_access_token for the duration of the request.
+
+    Health check (/healthz) bypasses auth.
+    Returns 401 JSON for missing, invalid, or expired tokens.
+    """
+    async def dispatch(self, request: Request, call_next):
+        if request.url.path == '/healthz':
+            return await call_next(request)
+
+        auth_header = request.headers.get('Authorization', '')
+        if not auth_header.startswith('Bearer '):
+            return JSONResponse(
+                {'error': 'Unauthorized: missing Bearer token'},
+                status_code=401,
+            )
+
+        token = auth_header[len('Bearer '):]
+        try:
+            email = await asyncio.to_thread(_validate_google_token, token)
+        except ValueError as e:
+            return JSONResponse({'error': f'Unauthorized: {e}'}, status_code=401)
+
+        logging.info(f"Authenticated request from {email}")
+        ctx = _current_access_token.set(token)
+        try:
+            return await call_next(request)
+        finally:
+            _current_access_token.reset(ctx)
+
 
 # -- MCP Server ----------------------------------------------------------------
 
@@ -1944,6 +2022,1483 @@ def sheets_batch_update(spreadsheetId: str, requests: List[Dict[str, Any]]) -> d
     except HttpError as e:
         return {"error": str(e)}
 
+# -- Gmail: Private helpers ----------------------------------------------------
+
+def _parse_message_headers(headers: list) -> dict:
+    """Extract common headers from Gmail payload headers list into a flat dict."""
+    keys = {
+        'from': 'from', 'to': 'to', 'cc': 'cc', 'bcc': 'bcc',
+        'subject': 'subject', 'date': 'date', 'reply-to': 'reply_to',
+        'message-id': 'message_id', 'in-reply-to': 'in_reply_to',
+        'references': 'references',
+    }
+    result = {}
+    for h in headers:
+        name_lower = h.get('name', '').lower()
+        if name_lower in keys:
+            result[keys[name_lower]] = h.get('value', '')
+    return result
+
+
+def _decode_message_body(payload: dict) -> dict:
+    """Recursively decode MIME parts and return {plain, html}."""
+    plain_parts = []
+    html_parts = []
+
+    def _walk(part):
+        mime = part.get('mimeType', '')
+        body = part.get('body', {})
+        data = body.get('data', '')
+        if data:
+            decoded = base64.urlsafe_b64decode(data + '==').decode('utf-8', errors='replace')
+            if mime == 'text/plain':
+                plain_parts.append(decoded)
+            elif mime == 'text/html':
+                html_parts.append(decoded)
+        for sub in part.get('parts', []):
+            _walk(sub)
+
+    _walk(payload)
+    return {
+        'plain': '\n'.join(plain_parts),
+        'html': '\n'.join(html_parts),
+    }
+
+
+def _build_raw_message(
+    to: str,
+    subject: str,
+    body: str,
+    from_addr: str = 'me',
+    cc: str = '',
+    bcc: str = '',
+    reply_to: str = '',
+    body_html: str = '',
+    in_reply_to: str = '',
+    references: str = '',
+) -> str:
+    """Build an RFC 2822 message and return it base64url-encoded."""
+    if body_html:
+        msg = email.mime.multipart.MIMEMultipart('alternative')
+        msg.attach(email.mime.text.MIMEText(body, 'plain', 'utf-8'))
+        msg.attach(email.mime.text.MIMEText(body_html, 'html', 'utf-8'))
+    else:
+        msg = email.mime.text.MIMEText(body, 'plain', 'utf-8')
+
+    msg['to'] = to
+    msg['subject'] = subject
+    if cc:
+        msg['cc'] = cc
+    if bcc:
+        msg['bcc'] = bcc
+    if reply_to:
+        msg['reply-to'] = reply_to
+    if in_reply_to:
+        msg['In-Reply-To'] = in_reply_to
+    if references:
+        msg['References'] = references
+
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode('utf-8')
+    return raw
+
+
+# -- Gmail: Group A — Profile --------------------------------------------------
+
+@mcp.tool()
+def gmail_get_profile() -> dict:
+    """
+    Get the current user's Gmail profile.
+
+    Returns email address, total messages, total threads, and the current historyId.
+    """
+    service = get_gmail_service()
+    try:
+        return service.users().getProfile(userId='me').execute()
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+# -- Gmail: Group B — Labels ---------------------------------------------------
+
+@mcp.tool()
+def gmail_list_labels() -> dict:
+    """List all Gmail labels (both system labels and user-created labels)."""
+    service = get_gmail_service()
+    try:
+        return service.users().labels().list(userId='me').execute()
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_get_label(labelId: str) -> dict:
+    """
+    Get details for a specific Gmail label.
+
+    Args:
+        labelId: The label ID (e.g. 'INBOX', 'SENT', or a user label ID like 'Label_123').
+    """
+    service = get_gmail_service()
+    try:
+        return service.users().labels().get(userId='me', id=labelId).execute()
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_create_label(
+    name: str,
+    label_list_visibility: str = 'labelShow',
+    message_list_visibility: str = 'show',
+    background_color: str = '',
+    text_color: str = '',
+) -> dict:
+    """
+    Create a new Gmail user label.
+
+    Args:
+        name: Display name for the label.
+        label_list_visibility: 'labelShow', 'labelShowIfUnread', or 'labelHide'.
+        message_list_visibility: 'show' or 'hide'.
+        background_color: Optional hex background color (e.g. '#ffffff').
+        text_color: Optional hex text color (e.g. '#000000').
+    """
+    service = get_gmail_service()
+    body: Dict[str, Any] = {
+        'name': name,
+        'labelListVisibility': label_list_visibility,
+        'messageListVisibility': message_list_visibility,
+    }
+    if background_color or text_color:
+        body['color'] = {}
+        if background_color:
+            body['color']['backgroundColor'] = background_color
+        if text_color:
+            body['color']['textColor'] = text_color
+    try:
+        return service.users().labels().create(userId='me', body=body).execute()
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_update_label(
+    labelId: str,
+    name: str = '',
+    label_list_visibility: str = '',
+    message_list_visibility: str = '',
+    background_color: str = '',
+    text_color: str = '',
+) -> dict:
+    """
+    Update an existing Gmail label (rename, recolor, or change visibility).
+
+    Args:
+        labelId: The label ID to update.
+        name: New display name (omit to keep current).
+        label_list_visibility: 'labelShow', 'labelShowIfUnread', or 'labelHide'.
+        message_list_visibility: 'show' or 'hide'.
+        background_color: Hex background color.
+        text_color: Hex text color.
+    """
+    service = get_gmail_service()
+    body: Dict[str, Any] = {'id': labelId}
+    if name:
+        body['name'] = name
+    if label_list_visibility:
+        body['labelListVisibility'] = label_list_visibility
+    if message_list_visibility:
+        body['messageListVisibility'] = message_list_visibility
+    if background_color or text_color:
+        body['color'] = {}
+        if background_color:
+            body['color']['backgroundColor'] = background_color
+        if text_color:
+            body['color']['textColor'] = text_color
+    try:
+        return service.users().labels().update(userId='me', id=labelId, body=body).execute()
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_delete_label(labelId: str) -> dict:
+    """
+    Permanently delete a user-created Gmail label.
+
+    Args:
+        labelId: The label ID to delete. System labels (INBOX, SENT, etc.) cannot be deleted.
+    """
+    service = get_gmail_service()
+    try:
+        service.users().labels().delete(userId='me', id=labelId).execute()
+        return {"deleted": True, "labelId": labelId}
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+# -- Gmail: Group C — Messages -------------------------------------------------
+
+@mcp.tool()
+def gmail_list_messages(
+    query: str = '',
+    max_results: int = 10,
+    page_token: str = '',
+    label_ids: List[str] = [],
+    include_spam_trash: bool = False,
+) -> dict:
+    """
+    Search or list Gmail messages.
+
+    Args:
+        query: Gmail search query (e.g. 'is:unread from:boss@company.com').
+        max_results: Maximum messages to return (default 10, max 500).
+        page_token: Token for pagination (from a previous response).
+        label_ids: Filter by label IDs (e.g. ['INBOX', 'UNREAD']).
+        include_spam_trash: Include messages from SPAM and TRASH.
+    """
+    service = get_gmail_service()
+    params: Dict[str, Any] = {
+        'userId': 'me',
+        'maxResults': max_results,
+        'includeSpamTrash': include_spam_trash,
+    }
+    if query:
+        params['q'] = query
+    if page_token:
+        params['pageToken'] = page_token
+    if label_ids:
+        params['labelIds'] = label_ids
+    try:
+        return service.users().messages().list(**params).execute()
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_get_message(messageId: str, format: str = 'full') -> dict:
+    """
+    Get a Gmail message with decoded headers and body.
+
+    Args:
+        messageId: The message ID.
+        format: 'full' (default), 'metadata', 'minimal', or 'raw'.
+
+    Returns a shaped dict with id, threadId, labelIds, snippet, headers, body, sizeEstimate, internalDate.
+    """
+    service = get_gmail_service()
+    try:
+        msg = service.users().messages().get(
+            userId='me', id=messageId, format=format
+        ).execute()
+        payload = msg.get('payload', {})
+        return {
+            'id': msg.get('id'),
+            'threadId': msg.get('threadId'),
+            'labelIds': msg.get('labelIds', []),
+            'snippet': msg.get('snippet', ''),
+            'headers': _parse_message_headers(payload.get('headers', [])),
+            'body': _decode_message_body(payload),
+            'sizeEstimate': msg.get('sizeEstimate'),
+            'internalDate': msg.get('internalDate'),
+        }
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_send_message(
+    to: str,
+    subject: str,
+    body: str,
+    cc: str = '',
+    bcc: str = '',
+    reply_to: str = '',
+    body_html: str = '',
+) -> dict:
+    """
+    Send a new email via Gmail.
+
+    Args:
+        to: Recipient email address (or comma-separated list).
+        subject: Email subject.
+        body: Plain-text email body.
+        cc: CC recipients (comma-separated).
+        bcc: BCC recipients (comma-separated).
+        reply_to: Reply-To address.
+        body_html: HTML version of the body (creates multipart/alternative if provided).
+    """
+    service = get_gmail_service()
+    raw = _build_raw_message(
+        to=to, subject=subject, body=body,
+        cc=cc, bcc=bcc, reply_to=reply_to, body_html=body_html,
+    )
+    try:
+        return service.users().messages().send(
+            userId='me', body={'raw': raw}
+        ).execute()
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_reply_to_message(
+    messageId: str,
+    body: str,
+    body_html: str = '',
+    reply_all: bool = False,
+) -> dict:
+    """
+    Reply to an existing Gmail message, automatically threading correctly.
+
+    Args:
+        messageId: The message ID to reply to.
+        body: Plain-text reply body.
+        body_html: HTML version of the reply body.
+        reply_all: If True, reply to all recipients (CC included).
+    """
+    service = get_gmail_service()
+    try:
+        orig = service.users().messages().get(
+            userId='me', id=messageId, format='full'
+        ).execute()
+        payload = orig.get('payload', {})
+        headers = _parse_message_headers(payload.get('headers', []))
+        thread_id = orig.get('threadId', '')
+        to = headers.get('from', '')
+        subject = headers.get('subject', '')
+        if not subject.lower().startswith('re:'):
+            subject = 'Re: ' + subject
+        cc = ''
+        if reply_all:
+            cc_parts = [v for k, v in headers.items() if k in ('to', 'cc') and v]
+            cc = ', '.join(cc_parts)
+        raw = _build_raw_message(
+            to=to, subject=subject, body=body, body_html=body_html, cc=cc,
+            in_reply_to=headers.get('message_id', ''),
+            references=' '.join(filter(None, [
+                headers.get('references', ''), headers.get('message_id', '')
+            ])),
+        )
+        return service.users().messages().send(
+            userId='me', body={'raw': raw, 'threadId': thread_id}
+        ).execute()
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_trash_message(messageId: str) -> dict:
+    """
+    Move a Gmail message to Trash (reversible).
+
+    Args:
+        messageId: The message ID to trash.
+    """
+    service = get_gmail_service()
+    try:
+        return service.users().messages().trash(userId='me', id=messageId).execute()
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_untrash_message(messageId: str) -> dict:
+    """
+    Restore a Gmail message from Trash.
+
+    Args:
+        messageId: The message ID to untrash.
+    """
+    service = get_gmail_service()
+    try:
+        return service.users().messages().untrash(userId='me', id=messageId).execute()
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_delete_message(messageId: str) -> dict:
+    """
+    Permanently delete a Gmail message (irreversible).
+
+    Args:
+        messageId: The message ID to permanently delete.
+    """
+    service = get_gmail_service()
+    try:
+        service.users().messages().delete(userId='me', id=messageId).execute()
+        return {"deleted": True, "messageId": messageId}
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_modify_message_labels(
+    messageId: str,
+    add_label_ids: List[str] = [],
+    remove_label_ids: List[str] = [],
+) -> dict:
+    """
+    Add or remove labels on a Gmail message.
+
+    Args:
+        messageId: The message ID to modify.
+        add_label_ids: Label IDs to add (e.g. ['STARRED']).
+        remove_label_ids: Label IDs to remove (e.g. ['UNREAD']).
+    """
+    service = get_gmail_service()
+    try:
+        return service.users().messages().modify(
+            userId='me', id=messageId,
+            body={'addLabelIds': add_label_ids, 'removeLabelIds': remove_label_ids},
+        ).execute()
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_mark_read(messageId: str) -> dict:
+    """
+    Mark a Gmail message as read (removes UNREAD label).
+
+    Args:
+        messageId: The message ID to mark as read.
+    """
+    return gmail_modify_message_labels(messageId, remove_label_ids=['UNREAD'])
+
+
+@mcp.tool()
+def gmail_mark_unread(messageId: str) -> dict:
+    """
+    Mark a Gmail message as unread (adds UNREAD label).
+
+    Args:
+        messageId: The message ID to mark as unread.
+    """
+    return gmail_modify_message_labels(messageId, add_label_ids=['UNREAD'])
+
+
+# -- Gmail: Group D — Threads --------------------------------------------------
+
+@mcp.tool()
+def gmail_list_threads(
+    query: str = '',
+    max_results: int = 10,
+    page_token: str = '',
+    label_ids: List[str] = [],
+    include_spam_trash: bool = False,
+) -> dict:
+    """
+    Search or list Gmail threads.
+
+    Args:
+        query: Gmail search query (e.g. 'is:unread subject:invoice').
+        max_results: Maximum threads to return (default 10, max 500).
+        page_token: Token for pagination.
+        label_ids: Filter by label IDs.
+        include_spam_trash: Include threads from SPAM and TRASH.
+    """
+    service = get_gmail_service()
+    params: Dict[str, Any] = {
+        'userId': 'me',
+        'maxResults': max_results,
+        'includeSpamTrash': include_spam_trash,
+    }
+    if query:
+        params['q'] = query
+    if page_token:
+        params['pageToken'] = page_token
+    if label_ids:
+        params['labelIds'] = label_ids
+    try:
+        return service.users().threads().list(**params).execute()
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_get_thread(threadId: str, format: str = 'full') -> dict:
+    """
+    Get all messages in a Gmail thread with decoded headers.
+
+    Args:
+        threadId: The thread ID.
+        format: 'full' (default), 'metadata', or 'minimal'.
+    """
+    service = get_gmail_service()
+    try:
+        thread = service.users().threads().get(
+            userId='me', id=threadId, format=format
+        ).execute()
+        messages = []
+        for msg in thread.get('messages', []):
+            payload = msg.get('payload', {})
+            messages.append({
+                'id': msg.get('id'),
+                'labelIds': msg.get('labelIds', []),
+                'snippet': msg.get('snippet', ''),
+                'headers': _parse_message_headers(payload.get('headers', [])),
+                'body': _decode_message_body(payload),
+                'internalDate': msg.get('internalDate'),
+            })
+        return {
+            'id': thread.get('id'),
+            'snippet': thread.get('snippet', ''),
+            'historyId': thread.get('historyId'),
+            'messages': messages,
+        }
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_modify_thread_labels(
+    threadId: str,
+    add_label_ids: List[str] = [],
+    remove_label_ids: List[str] = [],
+) -> dict:
+    """
+    Add or remove labels on all messages in a Gmail thread.
+
+    Args:
+        threadId: The thread ID.
+        add_label_ids: Label IDs to add.
+        remove_label_ids: Label IDs to remove.
+    """
+    service = get_gmail_service()
+    try:
+        return service.users().threads().modify(
+            userId='me', id=threadId,
+            body={'addLabelIds': add_label_ids, 'removeLabelIds': remove_label_ids},
+        ).execute()
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_trash_thread(threadId: str) -> dict:
+    """
+    Move an entire Gmail thread to Trash (reversible).
+
+    Args:
+        threadId: The thread ID to trash.
+    """
+    service = get_gmail_service()
+    try:
+        return service.users().threads().trash(userId='me', id=threadId).execute()
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_untrash_thread(threadId: str) -> dict:
+    """
+    Restore an entire Gmail thread from Trash.
+
+    Args:
+        threadId: The thread ID to restore.
+    """
+    service = get_gmail_service()
+    try:
+        return service.users().threads().untrash(userId='me', id=threadId).execute()
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_delete_thread(threadId: str) -> dict:
+    """
+    Permanently delete an entire Gmail thread (irreversible).
+
+    Args:
+        threadId: The thread ID to permanently delete.
+    """
+    service = get_gmail_service()
+    try:
+        service.users().threads().delete(userId='me', id=threadId).execute()
+        return {"deleted": True, "threadId": threadId}
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+# -- Gmail: Group E — Drafts ---------------------------------------------------
+
+@mcp.tool()
+def gmail_list_drafts(
+    max_results: int = 10,
+    page_token: str = '',
+) -> dict:
+    """
+    List Gmail drafts.
+
+    Args:
+        max_results: Maximum drafts to return (default 10).
+        page_token: Token for pagination.
+    """
+    service = get_gmail_service()
+    params: Dict[str, Any] = {'userId': 'me', 'maxResults': max_results}
+    if page_token:
+        params['pageToken'] = page_token
+    try:
+        return service.users().drafts().list(**params).execute()
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_get_draft(draftId: str) -> dict:
+    """
+    Get a Gmail draft with decoded headers and body.
+
+    Args:
+        draftId: The draft ID.
+    """
+    service = get_gmail_service()
+    try:
+        draft = service.users().drafts().get(userId='me', id=draftId, format='full').execute()
+        msg = draft.get('message', {})
+        payload = msg.get('payload', {})
+        return {
+            'id': draft.get('id'),
+            'message': {
+                'id': msg.get('id'),
+                'threadId': msg.get('threadId'),
+                'labelIds': msg.get('labelIds', []),
+                'snippet': msg.get('snippet', ''),
+                'headers': _parse_message_headers(payload.get('headers', [])),
+                'body': _decode_message_body(payload),
+            },
+        }
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_create_draft(
+    to: str,
+    subject: str,
+    body: str,
+    cc: str = '',
+    bcc: str = '',
+    body_html: str = '',
+) -> dict:
+    """
+    Create a Gmail draft (does not send).
+
+    Args:
+        to: Recipient email address.
+        subject: Email subject.
+        body: Plain-text body.
+        cc: CC recipients (comma-separated).
+        bcc: BCC recipients (comma-separated).
+        body_html: HTML body (creates multipart/alternative if provided).
+    """
+    service = get_gmail_service()
+    raw = _build_raw_message(to=to, subject=subject, body=body, cc=cc, bcc=bcc, body_html=body_html)
+    try:
+        return service.users().drafts().create(
+            userId='me', body={'message': {'raw': raw}}
+        ).execute()
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_update_draft(
+    draftId: str,
+    to: str,
+    subject: str,
+    body: str,
+    cc: str = '',
+    bcc: str = '',
+    body_html: str = '',
+) -> dict:
+    """
+    Replace the content of an existing Gmail draft.
+
+    Args:
+        draftId: The draft ID to update.
+        to: Recipient email address.
+        subject: Email subject.
+        body: Plain-text body.
+        cc: CC recipients (comma-separated).
+        bcc: BCC recipients (comma-separated).
+        body_html: HTML body.
+    """
+    service = get_gmail_service()
+    raw = _build_raw_message(to=to, subject=subject, body=body, cc=cc, bcc=bcc, body_html=body_html)
+    try:
+        return service.users().drafts().update(
+            userId='me', id=draftId, body={'message': {'raw': raw}}
+        ).execute()
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_send_draft(draftId: str) -> dict:
+    """
+    Send an existing Gmail draft.
+
+    Args:
+        draftId: The draft ID to send.
+    """
+    service = get_gmail_service()
+    try:
+        return service.users().drafts().send(
+            userId='me', body={'id': draftId}
+        ).execute()
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_delete_draft(draftId: str) -> dict:
+    """
+    Discard (permanently delete) a Gmail draft.
+
+    Args:
+        draftId: The draft ID to delete.
+    """
+    service = get_gmail_service()
+    try:
+        service.users().drafts().delete(userId='me', id=draftId).execute()
+        return {"deleted": True, "draftId": draftId}
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+# -- Gmail: Group F — Attachments ----------------------------------------------
+
+@mcp.tool()
+def gmail_get_attachment(messageId: str, attachmentId: str) -> dict:
+    """
+    Retrieve a Gmail attachment as base64url-encoded data.
+
+    The attachmentId can be found in the payload parts returned by gmail_get_message.
+
+    Args:
+        messageId: The message ID containing the attachment.
+        attachmentId: The attachment ID from the message payload.
+    """
+    service = get_gmail_service()
+    try:
+        return service.users().messages().attachments().get(
+            userId='me', messageId=messageId, id=attachmentId
+        ).execute()
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+# -- Gmail: Group G — Batch operations & import --------------------------------
+
+@mcp.tool()
+def gmail_batch_delete_messages(message_ids: List[str]) -> dict:
+    """
+    Permanently delete multiple Gmail messages in one API call.
+
+    Args:
+        message_ids: List of message IDs to permanently delete.
+    """
+    service = get_gmail_service()
+    try:
+        service.users().messages().batchDelete(
+            userId='me', body={'ids': message_ids}
+        ).execute()
+        return {"deleted": True, "count": len(message_ids)}
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_batch_modify_messages(
+    message_ids: List[str],
+    add_label_ids: List[str] = [],
+    remove_label_ids: List[str] = [],
+) -> dict:
+    """
+    Apply label changes to multiple Gmail messages in one API call.
+
+    Args:
+        message_ids: List of message IDs to modify.
+        add_label_ids: Label IDs to add to all specified messages.
+        remove_label_ids: Label IDs to remove from all specified messages.
+    """
+    service = get_gmail_service()
+    try:
+        service.users().messages().batchModify(
+            userId='me',
+            body={
+                'ids': message_ids,
+                'addLabelIds': add_label_ids,
+                'removeLabelIds': remove_label_ids,
+            },
+        ).execute()
+        return {"modified": True, "count": len(message_ids)}
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_insert_message(
+    raw: str,
+    label_ids: List[str] = [],
+    internal_date_source: str = 'receivedTime',
+    deleted: bool = False,
+) -> dict:
+    """
+    Insert a message into a Gmail mailbox without sending it (e.g. for archiving external mail).
+
+    Args:
+        raw: Base64url-encoded RFC 2822 message string.
+        label_ids: Labels to apply to the inserted message.
+        internal_date_source: 'receivedTime' (default) or 'dateHeader'.
+        deleted: If True, insert into TRASH immediately.
+    """
+    service = get_gmail_service()
+    try:
+        return service.users().messages().insert(
+            userId='me',
+            internalDateSource=internal_date_source,
+            deleted=deleted,
+            body={'raw': raw, 'labelIds': label_ids},
+        ).execute()
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_import_message(
+    raw: str,
+    label_ids: List[str] = [],
+    deleted: bool = False,
+    never_mark_spam: bool = False,
+    process_for_calendar: bool = True,
+) -> dict:
+    """
+    Import a message into Gmail with standard email delivery processing (spam filtering, etc.).
+
+    Args:
+        raw: Base64url-encoded RFC 2822 message string.
+        label_ids: Labels to apply.
+        deleted: If True, mark as deleted immediately.
+        never_mark_spam: If True, bypass spam filtering.
+        process_for_calendar: If True, process calendar invites in the message.
+    """
+    service = get_gmail_service()
+    try:
+        return service.users().messages().import_(
+            userId='me',
+            neverMarkSpam=never_mark_spam,
+            processForCalendar=process_for_calendar,
+            deleted=deleted,
+            body={'raw': raw, 'labelIds': label_ids},
+        ).execute()
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+# -- Gmail: Group H — History --------------------------------------------------
+
+@mcp.tool()
+def gmail_list_history(
+    start_history_id: str,
+    max_results: int = 100,
+    page_token: str = '',
+    label_id: str = '',
+    history_types: List[str] = [],
+) -> dict:
+    """
+    Get mailbox changes since a given historyId (incremental sync).
+
+    Args:
+        start_history_id: The historyId to start from (from gmail_get_profile or a previous response).
+        max_results: Maximum history records to return (default 100).
+        page_token: Token for pagination.
+        label_id: Only return history for messages with this label.
+        history_types: Filter types: 'messageAdded', 'messageDeleted', 'labelAdded', 'labelRemoved'.
+    """
+    service = get_gmail_service()
+    params: Dict[str, Any] = {
+        'userId': 'me',
+        'startHistoryId': start_history_id,
+        'maxResults': max_results,
+    }
+    if page_token:
+        params['pageToken'] = page_token
+    if label_id:
+        params['labelId'] = label_id
+    if history_types:
+        params['historyTypes'] = history_types
+    try:
+        return service.users().history().list(**params).execute()
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+# -- Gmail: Group I — Push notifications ---------------------------------------
+
+@mcp.tool()
+def gmail_watch(
+    topic_name: str,
+    label_ids: List[str] = [],
+    label_filter_behavior: str = 'include',
+) -> dict:
+    """
+    Start push notifications to a Google Cloud Pub/Sub topic.
+
+    Returns historyId and expiration timestamp. Watches expire after ~7 days and must be renewed.
+
+    Args:
+        topic_name: Pub/Sub topic name (e.g. 'projects/my-project/topics/gmail-push').
+        label_ids: Only notify for changes to messages with these labels. Empty means all labels.
+        label_filter_behavior: 'include' (default) or 'exclude' the specified label_ids.
+    """
+    service = get_gmail_service()
+    body: Dict[str, Any] = {
+        'topicName': topic_name,
+        'labelFilterBehavior': label_filter_behavior,
+    }
+    if label_ids:
+        body['labelIds'] = label_ids
+    try:
+        return service.users().watch(userId='me', body=body).execute()
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_stop_watch() -> dict:
+    """Stop receiving Gmail push notifications for the current user."""
+    service = get_gmail_service()
+    try:
+        service.users().stop(userId='me').execute()
+        return {"stopped": True}
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+# -- Gmail: Group J — Settings: Basic ------------------------------------------
+
+@mcp.tool()
+def gmail_get_auto_forwarding() -> dict:
+    """Get the auto-forwarding configuration for the Gmail account."""
+    service = get_gmail_service()
+    try:
+        return service.users().settings().getAutoForwarding(userId='me').execute()
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_update_auto_forwarding(
+    enabled: bool,
+    email_address: str = '',
+    disposition: str = 'leaveInInbox',
+) -> dict:
+    """
+    Enable or disable Gmail auto-forwarding.
+
+    Args:
+        enabled: True to enable auto-forwarding, False to disable.
+        email_address: The verified address to forward to (required when enabled=True).
+        disposition: What to do with forwarded messages: 'leaveInInbox', 'archive', 'trash', 'markRead'.
+    """
+    service = get_gmail_service()
+    body: Dict[str, Any] = {'enabled': enabled, 'disposition': disposition}
+    if email_address:
+        body['emailAddress'] = email_address
+    try:
+        return service.users().settings().updateAutoForwarding(userId='me', body=body).execute()
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_get_imap() -> dict:
+    """Get the IMAP settings for the Gmail account."""
+    service = get_gmail_service()
+    try:
+        return service.users().settings().getImap(userId='me').execute()
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_update_imap(
+    enabled: bool,
+    auto_expunge: bool = True,
+    expunge_behavior: str = 'archive',
+    max_folder_size: int = 0,
+) -> dict:
+    """
+    Configure IMAP access for the Gmail account.
+
+    Args:
+        enabled: True to enable IMAP.
+        auto_expunge: Auto-expunge messages marked for deletion.
+        expunge_behavior: 'archive', 'trash', or 'deleteForever'.
+        max_folder_size: Maximum folder size in MB (0 = unlimited).
+    """
+    service = get_gmail_service()
+    body: Dict[str, Any] = {
+        'enabled': enabled,
+        'autoExpunge': auto_expunge,
+        'expungeBehavior': expunge_behavior,
+        'maxFolderSize': max_folder_size,
+    }
+    try:
+        return service.users().settings().updateImap(userId='me', body=body).execute()
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_get_language() -> dict:
+    """Get the display language setting for the Gmail account."""
+    service = get_gmail_service()
+    try:
+        return service.users().settings().getLanguage(userId='me').execute()
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_update_language(display_language: str) -> dict:
+    """
+    Set the display language for the Gmail account.
+
+    Args:
+        display_language: BCP 47 language tag (e.g. 'en' for English, 'tl' for Filipino).
+    """
+    service = get_gmail_service()
+    try:
+        return service.users().settings().updateLanguage(
+            userId='me', body={'displayLanguage': display_language}
+        ).execute()
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_get_pop() -> dict:
+    """Get the POP settings for the Gmail account."""
+    service = get_gmail_service()
+    try:
+        return service.users().settings().getPop(userId='me').execute()
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_update_pop(
+    access_window: str = 'disabled',
+    disposition: str = 'leaveInInbox',
+) -> dict:
+    """
+    Configure POP access for the Gmail account.
+
+    Args:
+        access_window: 'disabled', 'fromNowOn', or 'allMail'.
+        disposition: What to do with POP-accessed messages: 'leaveInInbox', 'archive', 'trash', 'markRead'.
+    """
+    service = get_gmail_service()
+    try:
+        return service.users().settings().updatePop(
+            userId='me', body={'accessWindow': access_window, 'disposition': disposition}
+        ).execute()
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_get_vacation() -> dict:
+    """Get the vacation auto-responder settings for the Gmail account."""
+    service = get_gmail_service()
+    try:
+        return service.users().settings().getVacation(userId='me').execute()
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_update_vacation(
+    enable_auto_reply: bool,
+    response_subject: str = '',
+    response_body_plain_text: str = '',
+    response_body_html: str = '',
+    restrict_to_contacts: bool = False,
+    restrict_to_domain: bool = False,
+    start_time: int = 0,
+    end_time: int = 0,
+) -> dict:
+    """
+    Configure the Gmail vacation / out-of-office auto-responder.
+
+    Args:
+        enable_auto_reply: True to enable the auto-responder.
+        response_subject: Subject line of the auto-reply.
+        response_body_plain_text: Plain-text auto-reply body.
+        response_body_html: HTML auto-reply body.
+        restrict_to_contacts: Only reply to people in your contacts.
+        restrict_to_domain: Only reply to people in your Google Workspace domain.
+        start_time: Start time in milliseconds since epoch (0 = no start restriction).
+        end_time: End time in milliseconds since epoch (0 = no end restriction).
+    """
+    service = get_gmail_service()
+    body: Dict[str, Any] = {
+        'enableAutoReply': enable_auto_reply,
+        'restrictToContacts': restrict_to_contacts,
+        'restrictToDomain': restrict_to_domain,
+    }
+    if response_subject:
+        body['responseSubject'] = response_subject
+    if response_body_plain_text:
+        body['responseBodyPlainText'] = response_body_plain_text
+    if response_body_html:
+        body['responseBodyHtml'] = response_body_html
+    if start_time:
+        body['startTime'] = start_time
+    if end_time:
+        body['endTime'] = end_time
+    try:
+        return service.users().settings().updateVacation(userId='me', body=body).execute()
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+# -- Gmail: Group K — Settings: Filters ----------------------------------------
+
+@mcp.tool()
+def gmail_list_filters() -> dict:
+    """List all Gmail message filters for the account."""
+    service = get_gmail_service()
+    try:
+        return service.users().settings().filters().list(userId='me').execute()
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_get_filter(filterId: str) -> dict:
+    """
+    Get a specific Gmail message filter.
+
+    Args:
+        filterId: The filter ID.
+    """
+    service = get_gmail_service()
+    try:
+        return service.users().settings().filters().get(userId='me', id=filterId).execute()
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_create_filter(
+    criteria: Dict[str, Any],
+    action: Dict[str, Any],
+) -> dict:
+    """
+    Create a Gmail message filter.
+
+    Args:
+        criteria: Filter criteria dict. Supported keys:
+            from, to, subject, query, negatedQuery, hasAttachment (bool), size, sizeComparison.
+            Example: {"from": "boss@company.com", "hasAttachment": true}
+        action: Action dict. Supported keys:
+            addLabelIds (list), removeLabelIds (list), forward (email string).
+            Example: {"addLabelIds": ["STARRED"], "removeLabelIds": ["INBOX"]}
+    """
+    service = get_gmail_service()
+    try:
+        return service.users().settings().filters().create(
+            userId='me', body={'criteria': criteria, 'action': action}
+        ).execute()
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_delete_filter(filterId: str) -> dict:
+    """
+    Delete a Gmail message filter.
+
+    Args:
+        filterId: The filter ID to delete.
+    """
+    service = get_gmail_service()
+    try:
+        service.users().settings().filters().delete(userId='me', id=filterId).execute()
+        return {"deleted": True, "filterId": filterId}
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+# -- Gmail: Group L — Settings: Forwarding addresses ---------------------------
+
+@mcp.tool()
+def gmail_list_forwarding_addresses() -> dict:
+    """List all verified forwarding addresses for the Gmail account."""
+    service = get_gmail_service()
+    try:
+        return service.users().settings().forwardingAddresses().list(userId='me').execute()
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_get_forwarding_address(forwardingEmail: str) -> dict:
+    """
+    Get a specific forwarding address and its verification status.
+
+    Args:
+        forwardingEmail: The forwarding email address to look up.
+    """
+    service = get_gmail_service()
+    try:
+        return service.users().settings().forwardingAddresses().get(
+            userId='me', forwardingEmail=forwardingEmail
+        ).execute()
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_create_forwarding_address(forwardingEmail: str) -> dict:
+    """
+    Add a new forwarding address (triggers a verification email to that address).
+
+    Args:
+        forwardingEmail: The email address to add as a forwarding destination.
+    """
+    service = get_gmail_service()
+    try:
+        return service.users().settings().forwardingAddresses().create(
+            userId='me', body={'forwardingEmail': forwardingEmail}
+        ).execute()
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_delete_forwarding_address(forwardingEmail: str) -> dict:
+    """
+    Remove a forwarding address from the Gmail account.
+
+    Args:
+        forwardingEmail: The forwarding email address to remove.
+    """
+    service = get_gmail_service()
+    try:
+        service.users().settings().forwardingAddresses().delete(
+            userId='me', forwardingEmail=forwardingEmail
+        ).execute()
+        return {"deleted": True, "forwardingEmail": forwardingEmail}
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+# -- Gmail: Group M — Settings: Send-as aliases --------------------------------
+
+@mcp.tool()
+def gmail_list_send_as() -> dict:
+    """List all send-as aliases for the Gmail account."""
+    service = get_gmail_service()
+    try:
+        return service.users().settings().sendAs().list(userId='me').execute()
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_get_send_as(sendAsEmail: str) -> dict:
+    """
+    Get details of a specific send-as alias.
+
+    Args:
+        sendAsEmail: The send-as email address.
+    """
+    service = get_gmail_service()
+    try:
+        return service.users().settings().sendAs().get(
+            userId='me', sendAsEmail=sendAsEmail
+        ).execute()
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_create_send_as(
+    sendAsEmail: str,
+    displayName: str = '',
+    reply_to_address: str = '',
+    is_default: bool = False,
+    treat_as_alias: bool = True,
+) -> dict:
+    """
+    Create a new send-as alias for the Gmail account.
+
+    Args:
+        sendAsEmail: The email address to send as.
+        displayName: Display name shown to recipients.
+        reply_to_address: Reply-To address for this alias.
+        is_default: Make this the default send-as address.
+        treat_as_alias: Treat as alias (True) or external address (False).
+    """
+    service = get_gmail_service()
+    body: Dict[str, Any] = {
+        'sendAsEmail': sendAsEmail,
+        'isDefault': is_default,
+        'treatAsAlias': treat_as_alias,
+    }
+    if displayName:
+        body['displayName'] = displayName
+    if reply_to_address:
+        body['replyToAddress'] = reply_to_address
+    try:
+        return service.users().settings().sendAs().create(userId='me', body=body).execute()
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_update_send_as(
+    sendAsEmail: str,
+    displayName: str = '',
+    reply_to_address: str = '',
+    is_default: bool = False,
+    treat_as_alias: bool = True,
+) -> dict:
+    """
+    Update an existing send-as alias.
+
+    Args:
+        sendAsEmail: The send-as email address to update.
+        displayName: New display name.
+        reply_to_address: New Reply-To address.
+        is_default: Make this the default send-as address.
+        treat_as_alias: Treat as alias (True) or external address (False).
+    """
+    service = get_gmail_service()
+    body: Dict[str, Any] = {
+        'sendAsEmail': sendAsEmail,
+        'isDefault': is_default,
+        'treatAsAlias': treat_as_alias,
+    }
+    if displayName:
+        body['displayName'] = displayName
+    if reply_to_address:
+        body['replyToAddress'] = reply_to_address
+    try:
+        return service.users().settings().sendAs().update(
+            userId='me', sendAsEmail=sendAsEmail, body=body
+        ).execute()
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_delete_send_as(sendAsEmail: str) -> dict:
+    """
+    Remove a send-as alias from the Gmail account.
+
+    Args:
+        sendAsEmail: The send-as email address to remove.
+    """
+    service = get_gmail_service()
+    try:
+        service.users().settings().sendAs().delete(
+            userId='me', sendAsEmail=sendAsEmail
+        ).execute()
+        return {"deleted": True, "sendAsEmail": sendAsEmail}
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_verify_send_as(sendAsEmail: str) -> dict:
+    """
+    Re-send the verification email for a send-as alias.
+
+    Args:
+        sendAsEmail: The send-as email address to verify.
+    """
+    service = get_gmail_service()
+    try:
+        service.users().settings().sendAs().verify(
+            userId='me', sendAsEmail=sendAsEmail
+        ).execute()
+        return {"verificationSent": True, "sendAsEmail": sendAsEmail}
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+# -- Gmail: Group N — Settings: Delegates --------------------------------------
+
+@mcp.tool()
+def gmail_list_delegates() -> dict:
+    """List all delegates (accounts that can access this Gmail mailbox)."""
+    service = get_gmail_service()
+    try:
+        return service.users().settings().delegates().list(userId='me').execute()
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_get_delegate(delegateEmail: str) -> dict:
+    """
+    Get a delegate and their verification status.
+
+    Args:
+        delegateEmail: The delegate's email address.
+    """
+    service = get_gmail_service()
+    try:
+        return service.users().settings().delegates().get(
+            userId='me', delegateEmail=delegateEmail
+        ).execute()
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_create_delegate(delegateEmail: str) -> dict:
+    """
+    Add a delegate (triggers a verification email to the delegate).
+
+    Args:
+        delegateEmail: The email address of the account to grant delegate access.
+    """
+    service = get_gmail_service()
+    try:
+        return service.users().settings().delegates().create(
+            userId='me', body={'delegateEmail': delegateEmail}
+        ).execute()
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def gmail_delete_delegate(delegateEmail: str) -> dict:
+    """
+    Remove a delegate from the Gmail account.
+
+    Args:
+        delegateEmail: The delegate's email address to remove.
+    """
+    service = get_gmail_service()
+    try:
+        service.users().settings().delegates().delete(
+            userId='me', delegateEmail=delegateEmail
+        ).execute()
+        return {"deleted": True, "delegateEmail": delegateEmail}
+    except HttpError as e:
+        return {"error": str(e)}
+
+
 # -- Health check --------------------------------------------------------------
 
 @mcp.custom_route("/healthz", methods=["GET"])
@@ -1953,5 +3508,11 @@ async def healthz(request: Request) -> PlainTextResponse:
 # -- Entry point ---------------------------------------------------------------
 
 if __name__ == "__main__":
+    import uvicorn
     transport = os.environ.get("MCP_TRANSPORT", "sse")
-    mcp.run(transport=transport)
+    if transport == "sse":
+        app = mcp.sse_app()
+        app.add_middleware(OAuthMiddleware)
+        uvicorn.run(app, host="0.0.0.0", port=_port)
+    else:
+        mcp.run(transport=transport)
