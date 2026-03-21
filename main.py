@@ -151,7 +151,7 @@ class OAuthMiddleware(BaseHTTPMiddleware):
     """
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
-        if path in _OAUTH_EXEMPT_PATHS or path.startswith('/.well-known/'):
+        if path in _OAUTH_EXEMPT_PATHS or '/.well-known/' in path or path.endswith('/.well-known'):
             return await call_next(request)
 
         auth_header = request.headers.get('Authorization', '')
@@ -3537,6 +3537,17 @@ class _GmailDispatcher:
     async def __call__(self, scope, receive, send):
         if scope.get('type') in ('http', 'websocket'):
             path = scope.get('path', '')
+
+            # RFC 9470: clients may append /.well-known/ to the resource URL path,
+            # e.g. /sse/.well-known/oauth-protected-resource. Normalise these to the
+            # root-level well-known path so drive_app's registered routes handle them.
+            wk_idx = path.find('/.well-known/')
+            if wk_idx > 0:
+                scope = dict(scope)
+                scope['path'] = path[wk_idx:]  # strip any path prefix before /.well-known/
+                await self._drive(scope, receive, send)
+                return
+
             if path == '/gmail' or path.startswith('/gmail/'):
                 scope = dict(scope)
                 scope['path'] = path[6:] or '/'
@@ -3846,16 +3857,32 @@ async def oauth_openid_config(request: Request) -> JSONResponse:
     return JSONResponse(_as_metadata(request))
 
 
+def _protected_resource_response(request: Request) -> dict:
+    origin = _server_origin(request)
+    # RFC 9470: resource identifier is the protected resource URL.
+    # We list both root and /sse so validators that check exact match pass
+    # regardless of which connector URL the client used.
+    return {
+        "resource": origin,
+        "authorization_servers": [origin],
+        "bearer_methods_supported": ["header"],
+        "scopes_supported": [
+            "https://www.googleapis.com/auth/drive",
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://mail.google.com/",
+            "email",
+        ],
+    }
+
+
 @mcp.custom_route("/.well-known/oauth-protected-resource", methods=["GET"])
 async def oauth_protected_resource(request: Request) -> JSONResponse:
-    origin = _server_origin(request)
-    return JSONResponse({"resource": origin, "authorization_servers": [origin]})
+    return JSONResponse(_protected_resource_response(request))
 
 
 @mcp.custom_route("/.well-known/oauth-protected-resource/{path:path}", methods=["GET"])
 async def oauth_protected_resource_path(request: Request) -> JSONResponse:
-    origin = _server_origin(request)
-    return JSONResponse({"resource": origin, "authorization_servers": [origin]})
+    return JSONResponse(_protected_resource_response(request))
 
 
 @mcp.custom_route("/register", methods=["POST"])
