@@ -156,9 +156,16 @@ class OAuthMiddleware(BaseHTTPMiddleware):
 
         auth_header = request.headers.get('Authorization', '')
         if not auth_header.startswith('Bearer '):
+            origin = _server_origin(request)
             return JSONResponse(
                 {'error': 'Unauthorized: missing Bearer token'},
                 status_code=401,
+                headers={
+                    'WWW-Authenticate': (
+                        f'Bearer realm="Google Drive MCP",'
+                        f' resource_metadata="{origin}/.well-known/oauth-protected-resource"'
+                    )
+                },
             )
 
         token = auth_header[len('Bearer '):]
@@ -3721,39 +3728,63 @@ async def oauth_token(request: Request) -> JSONResponse:
 
     our_code = params.get('code', '')
     code_verifier = params.get('code_verifier', '')
+    redirect_uri = params.get('redirect_uri', '')
     grant_type = params.get('grant_type', '')
+
+    import sys as _sys
+    print(f"[/token] grant_type={grant_type!r} code_prefix={our_code[:12]!r} has_dot={'.' in our_code} redirect_uri={redirect_uri!r}", file=_sys.stderr, flush=True)
 
     if grant_type != 'authorization_code':
         return JSONResponse({'error': 'unsupported_grant_type'}, status_code=400)
-    if not our_code or not code_verifier:
+    if not our_code:
         return JSONResponse(
-            {'error': 'invalid_request', 'error_description': 'Missing code or code_verifier'},
+            {'error': 'invalid_request', 'error_description': 'Missing code'},
             status_code=400,
         )
 
-    try:
-        code_data = _verify_state_token(our_code, client_secret)
-    except ValueError as e:
-        return JSONResponse({'error': 'invalid_grant', 'error_description': str(e)}, status_code=400)
+    if '.' in our_code:
+        # Our signed token path: PKCE-verified proxy flow via /authorize → /oauth/callback
+        if not code_verifier:
+            return JSONResponse(
+                {'error': 'invalid_request', 'error_description': 'Missing code_verifier'},
+                status_code=400,
+            )
+        try:
+            code_data = _verify_state_token(our_code, client_secret)
+        except ValueError as e:
+            print(f"[/token] signed-token verify failed: {e}", file=_sys.stderr, flush=True)
+            return JSONResponse({'error': 'invalid_grant', 'error_description': str(e)}, status_code=400)
 
-    # Verify PKCE: SHA-256(code_verifier) must equal code_challenge
-    code_challenge = code_data.get('code_challenge', '')
-    method = code_data.get('code_challenge_method', 'S256')
-    if method == 'S256':
-        digest = hashlib.sha256(code_verifier.encode()).digest()
-        computed = base64.urlsafe_b64encode(digest).rstrip(b'=').decode()
+        # Verify PKCE: SHA-256(code_verifier) must equal code_challenge
+        code_challenge = code_data.get('code_challenge', '')
+        method = code_data.get('code_challenge_method', 'S256')
+        if method == 'S256':
+            digest = hashlib.sha256(code_verifier.encode()).digest()
+            computed = base64.urlsafe_b64encode(digest).rstrip(b'=').decode()
+        else:
+            computed = code_verifier  # plain method (not recommended but spec-compliant)
+
+        if not hmac.compare_digest(computed, code_challenge):
+            return JSONResponse(
+                {'error': 'invalid_grant', 'error_description': 'PKCE verification failed'},
+                status_code=400,
+            )
+
+        google_code = code_data['google_code']
+        callback_uri = code_data['callback_uri']
     else:
-        computed = code_verifier  # plain method (not recommended but spec-compliant)
-
-    if not hmac.compare_digest(computed, code_challenge):
-        return JSONResponse(
-            {'error': 'invalid_grant', 'error_description': 'PKCE verification failed'},
-            status_code=400,
-        )
+        # Raw Google authorization code path: connector authorized via Google's own
+        # OAuth endpoints (manual connector config) and sent the raw code here.
+        # Skip PKCE — Google already authenticated the user.
+        google_code = our_code
+        callback_uri = redirect_uri
+        if not callback_uri:
+            return JSONResponse(
+                {'error': 'invalid_request', 'error_description': 'Missing redirect_uri'},
+                status_code=400,
+            )
 
     # Exchange the Google authorization code for Google OAuth tokens
-    google_code = code_data['google_code']
-    callback_uri = code_data['callback_uri']
     token_body = urllib.parse.urlencode({
         'code': google_code,
         'client_id': client_id,
