@@ -3624,6 +3624,9 @@ async def oauth_authorize(request: Request) -> RedirectResponse:
     code_challenge = request.query_params.get('code_challenge', '')
     code_challenge_method = request.query_params.get('code_challenge_method', 'S256')
 
+    import sys as _sys
+    print(f"[/authorize] redirect_uri={claude_redirect_uri!r} state={claude_state!r}", file=_sys.stderr, flush=True)
+
     server_origin = _server_origin(request)
     callback_uri = f"{server_origin}/oauth/callback"
 
