@@ -3891,8 +3891,10 @@ async def oauth_protected_resource_path(request: Request) -> JSONResponse:
 @mcp.custom_route("/register", methods=["POST"])
 async def oauth_register(request: Request) -> JSONResponse:
     """Dynamic client registration (RFC 7591) — returns a static client_id."""
+    import sys as _sys
     body_bytes = await request.body()
     body = json.loads(body_bytes) if body_bytes else {}
+    print(f"[/register] body={json.dumps(body)}", file=_sys.stderr, flush=True)
     return JSONResponse({
         "client_id": "mcp-client",
         "client_id_issued_at": int(time.time()),
