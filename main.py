@@ -3748,6 +3748,31 @@ async def oauth_token(request: Request) -> JSONResponse:
     import sys as _sys
     print(f"[/token] grant_type={grant_type!r} code_prefix={our_code[:12]!r} has_dot={'.' in our_code} redirect_uri={redirect_uri!r}", file=_sys.stderr, flush=True)
 
+    if grant_type == 'refresh_token':
+        refresh_token = params.get('refresh_token', '')
+        if not refresh_token:
+            return JSONResponse({'error': 'invalid_request', 'error_description': 'Missing refresh_token'}, status_code=400)
+        refresh_body = urllib.parse.urlencode({
+            'grant_type': 'refresh_token',
+            'refresh_token': refresh_token,
+            'client_id': client_id,
+            'client_secret': client_secret,
+        }).encode()
+        try:
+            req = urllib.request.Request(
+                'https://oauth2.googleapis.com/token',
+                data=refresh_body,
+                method='POST',
+                headers={'Content-Type': 'application/x-www-form-urlencoded'},
+            )
+            with urllib.request.urlopen(req) as resp:
+                token_response = json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            error_body = json.loads(e.read())
+            print(f"[/token] refresh failed: {error_body}", file=_sys.stderr, flush=True)
+            return JSONResponse({'error': 'invalid_grant', 'error_description': str(error_body)}, status_code=400)
+        return JSONResponse(token_response)
+
     if grant_type != 'authorization_code':
         return JSONResponse({'error': 'unsupported_grant_type'}, status_code=400)
     if not our_code:
@@ -3844,7 +3869,7 @@ def _as_metadata(request: Request) -> dict:
         "token_endpoint": f"{origin}/token",
         "registration_endpoint": f"{origin}/register",
         "response_types_supported": ["code"],
-        "grant_types_supported": ["authorization_code"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
         "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": ["none", "client_secret_post"],
     }
@@ -3899,9 +3924,9 @@ async def oauth_register(request: Request) -> JSONResponse:
         "client_id": "mcp-client",
         "client_id_issued_at": int(time.time()),
         "redirect_uris": body.get("redirect_uris", []),
-        "grant_types": ["authorization_code"],
+        "grant_types": ["authorization_code", "refresh_token"],
         "response_types": ["code"],
-        "token_endpoint_auth_method": "none",
+        "token_endpoint_auth_method": "client_secret_post",
     }, status_code=201)
 
 
