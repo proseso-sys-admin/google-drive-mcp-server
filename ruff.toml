@@ -1,0 +1,38 @@
+# Ruff configuration for Proseso Python projects.
+# Copy to each Python project root.
+#
+# Usage:
+#   ruff check .          # lint
+#   ruff format .         # format (writes)
+#   ruff format --check . # format check (CI — exits non-zero if unformatted)
+
+target-version = "py312"
+line-length = 120
+
+[lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort (import ordering)
+    "N",    # pep8-naming
+    "UP",   # pyupgrade (modern syntax)
+    "B",    # bugbear (common bugs)
+    "S",    # bandit (security)
+    "T20",  # flake8-print (no print() in production)
+    "SIM",  # flake8-simplify
+    "RUF",  # ruff-specific rules
+]
+ignore = [
+    "S101",  # allow assert in tests
+    "S104",  # allow binding to 0.0.0.0 (Cloud Run needs it)
+    "E501",  # line length handled by formatter
+    "N803",  # Google API tools use camelCase params (spreadsheetId, sheetId, etc.)
+]
+
+[lint.per-file-ignores]
+"tests/**/*.py" = ["S101"]  # assert is fine in tests
+
+[format]
+quote-style = "double"
+indent-style = "space"

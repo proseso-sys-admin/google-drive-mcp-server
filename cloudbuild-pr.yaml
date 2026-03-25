@@ -1,0 +1,14 @@
+# PR-check: validates code before merge. Does NOT deploy.
+steps:
+  - name: 'python:3.12-slim'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        pip install --quiet ruff
+        python -c "import py_compile; py_compile.compile('main.py', doraise=True)"
+        ruff check .
+        ruff format --check .
+
+options:
+  logging: CLOUD_LOGGING_ONLY
