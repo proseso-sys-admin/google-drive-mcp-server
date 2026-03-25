@@ -398,6 +398,295 @@ def script_deploy(scriptId: str, version_number: int, description: str = "") -> 
         return {"error": str(e)}
 
 
+@mcp.tool()
+def script_create_project(title: str, parent_id: str = "") -> dict:
+    """
+    Create a new Google Apps Script project.
+
+    Args:
+        title: The display name of the script project.
+        parent_id: Optional Google Drive file ID to bind the script to
+                   (e.g. a Sheets/Docs/Slides file). If empty, creates a standalone script.
+    """
+    service = get_script_service()
+    body: dict[str, Any] = {"title": title}
+    if parent_id:
+        body["parentId"] = parent_id
+    try:
+        project = service.projects().create(body=body).execute()
+        return project
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def script_get_project(scriptId: str) -> dict:
+    """
+    Get metadata for a Google Apps Script project.
+    Returns title, scriptId, parentId, createTime, updateTime.
+    """
+    service = get_script_service()
+    try:
+        project = service.projects().get(scriptId=scriptId).execute()
+        return project
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def script_get_metrics(
+    scriptId: str,
+    granularity: str = "WEEKLY",
+) -> dict:
+    """
+    Get execution metrics for a Google Apps Script project.
+    Returns active users, total executions, and failed executions.
+
+    Args:
+        scriptId: The script project ID.
+        granularity: WEEKLY or DAILY.
+    """
+    service = get_script_service()
+    try:
+        metrics = (
+            service.projects()
+            .getMetrics(
+                scriptId=scriptId,
+                metricsGranularity=granularity,
+            )
+            .execute()
+        )
+        return metrics
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def script_list_versions(
+    scriptId: str,
+    page_size: int = 50,
+    page_token: str = "",
+) -> dict:
+    """
+    List all versions of a Google Apps Script project.
+
+    Args:
+        scriptId: The script project ID.
+        page_size: Max results per page (default 50).
+        page_token: Token for the next page of results.
+    """
+    service = get_script_service()
+    kwargs: dict[str, Any] = {"scriptId": scriptId, "pageSize": page_size}
+    if page_token:
+        kwargs["pageToken"] = page_token
+    try:
+        result = service.projects().versions().list(**kwargs).execute()
+        return result
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def script_get_version(scriptId: str, version_number: int) -> dict:
+    """
+    Get a specific version of a Google Apps Script project.
+
+    Args:
+        scriptId: The script project ID.
+        version_number: The version number to retrieve.
+    """
+    service = get_script_service()
+    try:
+        version = service.projects().versions().get(scriptId=scriptId, versionNumber=version_number).execute()
+        return version
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def script_list_deployments(
+    scriptId: str,
+    page_size: int = 50,
+    page_token: str = "",
+) -> dict:
+    """
+    List all deployments of a Google Apps Script project.
+
+    Args:
+        scriptId: The script project ID.
+        page_size: Max results per page (default 50).
+        page_token: Token for the next page of results.
+    """
+    service = get_script_service()
+    kwargs: dict[str, Any] = {"scriptId": scriptId, "pageSize": page_size}
+    if page_token:
+        kwargs["pageToken"] = page_token
+    try:
+        result = service.projects().deployments().list(**kwargs).execute()
+        return result
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def script_get_deployment(scriptId: str, deployment_id: str) -> dict:
+    """
+    Get details of a specific deployment.
+
+    Args:
+        scriptId: The script project ID.
+        deployment_id: The deployment ID to retrieve.
+    """
+    service = get_script_service()
+    try:
+        deployment = service.projects().deployments().get(scriptId=scriptId, deploymentId=deployment_id).execute()
+        return deployment
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def script_update_deployment(
+    scriptId: str,
+    deployment_id: str,
+    version_number: int,
+    description: str = "",
+) -> dict:
+    """
+    Update an existing deployment to point to a different version.
+
+    Args:
+        scriptId: The script project ID.
+        deployment_id: The deployment ID to update.
+        version_number: The version number the deployment should use.
+        description: Optional description for the deployment config.
+    """
+    service = get_script_service()
+    config: dict[str, Any] = {
+        "scriptId": scriptId,
+        "versionNumber": version_number,
+    }
+    if description:
+        config["description"] = description
+    try:
+        deployment = (
+            service.projects()
+            .deployments()
+            .update(
+                scriptId=scriptId,
+                deploymentId=deployment_id,
+                body={"deploymentConfig": config},
+            )
+            .execute()
+        )
+        return deployment
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def script_delete_deployment(scriptId: str, deployment_id: str) -> dict:
+    """
+    Delete a deployment of a Google Apps Script project.
+
+    Args:
+        scriptId: The script project ID.
+        deployment_id: The deployment ID to delete.
+    """
+    service = get_script_service()
+    try:
+        service.projects().deployments().delete(scriptId=scriptId, deploymentId=deployment_id).execute()
+        return {"status": "deleted", "deploymentId": deployment_id}
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def script_list_processes(
+    page_size: int = 50,
+    page_token: str = "",
+    script_id: str = "",
+    function_name: str = "",
+    process_type: str = "",
+    process_status: str = "",
+) -> dict:
+    """
+    List execution processes for the authenticated user across all scripts.
+    Use script_list_script_processes to filter by a specific script.
+
+    Args:
+        page_size: Max results per page (default 50).
+        page_token: Token for the next page of results.
+        script_id: Filter by script ID (optional).
+        function_name: Filter by function name (optional).
+        process_type: Filter by type: PROCESS_TYPE_UNSPECIFIED, ADD_ON,
+                      EXECUTION_API, TIME_DRIVEN, TRIGGER, WEBAPP, EDITOR,
+                      SIMPLE_TRIGGER, MENU, BATCH_TASK (optional).
+        process_status: Filter by status: PROCESS_STATUS_UNSPECIFIED, RUNNING,
+                        PAUSED, COMPLETED, CANCELED, FAILED, TIMED_OUT,
+                        UNKNOWN, DELAYED (optional).
+    """
+    service = get_script_service()
+    kwargs: dict[str, Any] = {"pageSize": page_size}
+    if page_token:
+        kwargs["pageToken"] = page_token
+    # Build userProcessFilter.* query parameters
+    if script_id:
+        kwargs["userProcessFilter.scriptId"] = script_id
+    if function_name:
+        kwargs["userProcessFilter.functionName"] = function_name
+    if process_type:
+        kwargs["userProcessFilter.types"] = process_type
+    if process_status:
+        kwargs["userProcessFilter.statuses"] = process_status
+    try:
+        result = service.processes().list(**kwargs).execute()
+        return result
+    except HttpError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def script_list_script_processes(
+    scriptId: str,
+    page_size: int = 50,
+    page_token: str = "",
+    function_name: str = "",
+    process_type: str = "",
+    process_status: str = "",
+) -> dict:
+    """
+    List execution processes for a specific Apps Script project.
+
+    Args:
+        scriptId: The script project ID.
+        page_size: Max results per page (default 50).
+        page_token: Token for the next page of results.
+        function_name: Filter by function name (optional).
+        process_type: Filter by type: PROCESS_TYPE_UNSPECIFIED, ADD_ON,
+                      EXECUTION_API, TIME_DRIVEN, TRIGGER, WEBAPP, EDITOR,
+                      SIMPLE_TRIGGER, MENU, BATCH_TASK (optional).
+        process_status: Filter by status: PROCESS_STATUS_UNSPECIFIED, RUNNING,
+                        PAUSED, COMPLETED, CANCELED, FAILED, TIMED_OUT,
+                        UNKNOWN, DELAYED (optional).
+    """
+    service = get_script_service()
+    kwargs: dict[str, Any] = {"scriptId": scriptId, "pageSize": page_size}
+    if page_token:
+        kwargs["pageToken"] = page_token
+    if function_name:
+        kwargs["scriptProcessFilter.functionName"] = function_name
+    if process_type:
+        kwargs["scriptProcessFilter.types"] = process_type
+    if process_status:
+        kwargs["scriptProcessFilter.statuses"] = process_status
+    try:
+        result = service.processes().listScriptProcesses(**kwargs).execute()
+        return result
+    except HttpError as e:
+        return {"error": str(e)}
+
+
 # -- Google Sheets Tools -------------------------------------------------------
 
 
