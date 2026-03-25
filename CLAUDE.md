@@ -18,10 +18,18 @@ python main.py
 
 ## Deployment
 
-Push to `main` branch triggers Cloud Build automatically (`cloudbuild.yaml`):
+Push to `main` triggers Cloud Build automatically (`cloudbuild.yaml`):
 - Builds Docker image → pushes to `gcr.io/$PROJECT_ID/google-drive-mcp-server:$COMMIT_SHA`
 - Deploys to Cloud Run in `asia-southeast1`
-- Secrets injected from Google Secret Manager: `google-drive-mcp-secret` → `MCP_SECRET`, `google-drive-creds-json` → `GOOGLE_APPLICATION_CREDENTIALS_JSON`
+- Secrets injected from Google Secret Manager
+
+### Deploy flow
+1. Push to feature branch → open PR
+2. `google-drive-mcp-server-pr-check` runs (ruff lint + format)
+3. PR check must pass before merge (branch protection)
+4. Merge to `main` → deploy trigger fires → Cloud Run updated
+
+**Do NOT use `gcloud builds submit`** — it creates a duplicate deploy.
 
 ## Quality Tools
 
