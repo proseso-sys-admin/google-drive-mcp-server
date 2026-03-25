@@ -19,6 +19,7 @@ OAuth scopes to request in the Google Cloud OAuth client:
   https://www.googleapis.com/auth/spreadsheets
   https://www.googleapis.com/auth/script.projects
   https://www.googleapis.com/auth/script.processes
+  https://www.googleapis.com/auth/script.external_request
   https://mail.google.com/
   email (to identify the user in logs)
 
@@ -4402,6 +4403,7 @@ async def oauth_authorize(request: Request) -> RedirectResponse:
         "https://www.googleapis.com/auth/spreadsheets "
         "https://www.googleapis.com/auth/script.projects "
         "https://www.googleapis.com/auth/script.processes "
+        "https://www.googleapis.com/auth/script.external_request "
         "https://mail.google.com/ "
         "email"
     )
