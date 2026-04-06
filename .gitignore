@@ -3,3 +3,6 @@ __pycache__/
 .env
 .DS_Store
 venv/
+.playwright-mcp/
+.superpowers/
+tasks/
